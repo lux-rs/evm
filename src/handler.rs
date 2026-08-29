@@ -78,6 +78,12 @@ where
         // rather than skipping the call is deliberate — an EIP-7702 refund is
         // recorded on the gas before this method runs, and leaving it in place
         // would refund under a rule that says there are no refunds.
+        //
+        // This is the whole change. revm reimburses the sender
+        // `(remaining + refunded) * price` and computes `used` as
+        // `spent - refunded`, so a zeroed counter is at once the sender getting
+        // nothing back and the block reporting the larger gasUsed — which is
+        // exactly the two halves of Go's `refundGas` under `isEVM`.
         exec_result.gas_mut().set_refund(0);
     }
 

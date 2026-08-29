@@ -62,7 +62,14 @@ impl Default for Run {
 pub struct Outcome {
     pub gas_used: u64,
     pub coinbase: U256,
+    /// What the sender paid, all in: the balance it no longer has.
+    pub spent: U256,
     pub output: Bytes,
+}
+
+/// The sender's opening balance, so a debit can be read as a difference.
+pub fn funded() -> U256 {
+    U256::from(10u64).pow(U256::from(20u64))
 }
 
 type Error = EVMError<core::convert::Infallible>;
@@ -72,7 +79,7 @@ pub fn run(r: Run) -> Outcome {
     db.insert_account_info(
         CALLER,
         AccountInfo {
-            balance: U256::from(10u64).pow(U256::from(20u64)),
+            balance: funded(),
             ..Default::default()
         },
     );
@@ -115,12 +122,16 @@ pub fn run(r: Run) -> Outcome {
     assert!(result.is_success(), "unexpected outcome: {result:?}");
 
     let state = evm.ctx.journal_mut().finalize();
+    let balance = |who| {
+        state
+            .get(&who)
+            .map(|a: &revm::state::Account| a.info.balance)
+            .unwrap_or_default()
+    };
     Outcome {
         gas_used: result.gas_used(),
-        coinbase: state
-            .get(&COINBASE)
-            .map(|a| a.info.balance)
-            .unwrap_or_default(),
+        coinbase: balance(COINBASE),
+        spent: funded() - balance(CALLER),
         output: result.into_output().unwrap_or_default(),
     }
 }

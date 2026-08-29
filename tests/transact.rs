@@ -124,6 +124,27 @@ fn lux_grants_no_refund_for_clearing_storage() {
 }
 
 #[test]
+fn the_sender_is_charged_for_the_refund_it_does_not_get() {
+    // The refund rule has two halves and one switch: the sender is not handed
+    // the gas back, and the block reports it as used. Reading the sender's
+    // balance is the half a gas-only test would miss.
+    let lux = clearing(Chain::lux());
+    let eth = clearing(Chain::ethereum());
+
+    assert_eq!(
+        lux.spent,
+        U256::from(lux.gas_used as u128 * PRICE),
+        "everything the sender paid is gas at the price it offered"
+    );
+    assert_eq!(eth.spent, U256::from(eth.gas_used as u128 * PRICE));
+    assert!(
+        lux.spent > eth.spent,
+        "the sender keeps {} wei more on Ethereum",
+        lux.spent - eth.spent
+    );
+}
+
+#[test]
 fn the_beneficiary_is_paid_on_the_gas_the_rules_leave_behind() {
     // The two rules compose: under Lux the beneficiary is paid for gas that
     // Ethereum would have handed back to the sender.
