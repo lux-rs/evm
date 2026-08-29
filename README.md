@@ -11,17 +11,19 @@ same roots, same block hashes.
 revm is a dependency, not a fork. Three implementations of one protocol are
 already two more than the protocol needs, and a fourth interpreter maintained
 here would be a fifth thing to keep in step. Everything Lux changes is reachable
-through revm's own seams, so the crate is four small things:
+through revm's own seams, so what lives here is the policy and the encodings,
+and nothing else:
 
 | module       | what it holds                                                     |
 | ------------ | ----------------------------------------------------------------- |
-| `rules`      | the three rules that make Lux not Ethereum, as one value           |
+| `rules`      | the rules that make Lux not Ethereum, as one value                 |
 | `handler`    | those rules in the two `Handler` methods that ask about them       |
+| `gas`        | what a transaction owes before a single opcode runs                |
 | `precompile` | the stock precompiles behind the classical-family gate             |
 | `header`     | how a block is named: `keccak256(rlp(header))`                     |
 | `root`       | what a block commits to: the transaction, receipt and state tries  |
 
-The three rules, with the Go they come from:
+The rules, with the Go they come from:
 
 - **No refunds.** `luxfi/evm core/state_transition.go refundGas` applies the
   refund counter only `if !isEVM`, so `gasUsed == gasSpent` on every Lux block.
@@ -30,6 +32,11 @@ The three rules, with the Go they come from:
   burns the difference.
 - **The split.** Once `IsFeeSplit(blockTime)`, `core/fee_split.go creditTxFee`
   credits `floor(fee/2)` and the other half is burned by never being credited.
+- **Initcode is metered from Durango, not from Shanghai.**
+  `core/state_transition.go IntrinsicGas` charges the EIP-3860 word cost under
+  `IsDurango`, a Lux upgrade. Every Lux network has Durango live from genesis,
+  so the two agree in production and differ only on a chain configured without
+  it — where a node on Ethereum's schedule overcharges every deployment.
 
 ## What is checked
 
@@ -41,7 +48,9 @@ vectors directory, or leave it and the harness looks beside this crate:
 - the genesis header built in Rust encodes to **byte-identical RLP** and seals
   to the block hash the live node reports;
 - the transactions root over five signed transactions of four types is the root
-  Go derives, including the EIP-2718 envelopes that are easy to wrap wrongly.
+  Go derives, including the EIP-2718 envelopes that are easy to wrap wrongly;
+- intrinsic gas for calldata, zero bytes and deployment, and both deployment
+  address rules, match what Go computes.
 
 Against real execution, through revm with this handler installed:
 

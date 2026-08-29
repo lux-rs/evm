@@ -3,11 +3,11 @@
 
 //! The rules that make Lux not Ethereum.
 //!
-//! There are exactly three, and in Go they are three `if` branches buried in a
+//! There are four, and in Go they are four `if` branches spread across a
 //! seven-hundred-line state transition. Here they are one value, because that
 //! is what they are: a chain says when each rule turns on, a block time selects
-//! them, and the selected rules answer two questions — what the sender gets
-//! back, and what the beneficiary receives.
+//! them, and the selected rules answer what the sender pays, what the sender
+//! gets back, and what the beneficiary receives.
 //!
 //! Their sources, so a reader can check rather than trust:
 //!
@@ -20,9 +20,15 @@
 //! - **the split.** `luxfi/evm@v1.104.30 core/fee_split.go creditTxFee`: once
 //!   `IsFeeSplit(blockTime)`, the beneficiary receives `floor(fee/2)` and the
 //!   other half is burned by never being credited to anyone.
+//! - **initcode is metered from Durango, not from Shanghai.**
+//!   `luxfi/evm@v1.104.30 core/state_transition.go IntrinsicGas` charges the
+//!   EIP-3860 word cost under `IsDurango`, a Lux upgrade, where Ethereum
+//!   charges it under Shanghai. On a chain with Durango live from genesis the
+//!   two agree; on one without, a Rust node overcharges every deployment.
 //!
-//! The field names are Go's — `evm` is `IsEVM`, `split` is `IsFeeSplit` — so
-//! that one rule has one name in both languages.
+//! The field names are Go's — `evm` is `IsEVM`, `split` is `IsFeeSplit`,
+//! `durango` is `IsDurango` — so that one rule has one name in both
+//! languages.
 
 /// When a chain turns each rule on. `None` is never; `Some(t)` is every block
 /// at or after `t`.
@@ -36,6 +42,9 @@ pub struct Chain {
     pub evm: Option<u64>,
     /// The fee-split upgrade.
     pub split: Option<u64>,
+    /// `NetworkUpgrades.DurangoTimestamp` — among other things, when initcode
+    /// starts being metered.
+    pub durango: Option<u64>,
 }
 
 impl Chain {
@@ -48,14 +57,22 @@ impl Chain {
         Self {
             evm: Some(0),
             split: None,
+            durango: Some(0),
         }
     }
 
-    /// Ethereum's rules: neither Lux rule ever turns on.
+    /// Ethereum's rules: no Lux upgrade ever turns on.
+    ///
+    /// `durango` is left unset for symmetry with the others, and callers that
+    /// want Ethereum's own initcode metering should say so with a spec at or
+    /// past Shanghai and `durango: Some(0)`. Nothing on a Lux network runs
+    /// this configuration; it exists so the difference each rule makes can be
+    /// measured against the chain that does not have it.
     pub const fn ethereum() -> Self {
         Self {
             evm: None,
             split: None,
+            durango: None,
         }
     }
 
@@ -64,6 +81,7 @@ impl Chain {
         Rules {
             evm: forked(self.evm, time),
             split: forked(self.split, time),
+            durango: forked(self.durango, time),
         }
     }
 }
@@ -83,6 +101,8 @@ pub struct Rules {
     pub evm: bool,
     /// The beneficiary receives half the fee; the other half is burned.
     pub split: bool,
+    /// Deploying meters its initcode by the word.
+    pub durango: bool,
 }
 
 impl Rules {
@@ -133,7 +153,7 @@ mod tests {
     fn a_fork_is_active_from_its_second_onward() {
         let c = Chain {
             evm: Some(100),
-            split: None,
+            ..Chain::ethereum()
         };
         assert!(!c.at(99).evm);
         assert!(
@@ -179,6 +199,7 @@ mod tests {
         let r = Rules {
             evm: true,
             split: true,
+            durango: true,
         };
         assert_eq!(r.reward(3, 3, 0), 4, "floor(9/2), not 3*floor(3/2)");
     }

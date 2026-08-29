@@ -58,8 +58,8 @@ fn the_fee_split_halves_what_the_beneficiary_receives() {
     let whole = run(Run::default());
     let half = run(Run {
         chain: Chain {
-            evm: Some(0),
             split: Some(0),
+            ..Chain::lux()
         },
         ..Default::default()
     });
@@ -73,8 +73,8 @@ fn the_fee_split_halves_what_the_beneficiary_receives() {
 #[test]
 fn a_rule_that_has_not_activated_yet_does_not_apply() {
     let split_later = Chain {
-        evm: Some(0),
         split: Some(10),
+        ..Chain::lux()
     };
     assert_eq!(
         run(Run {

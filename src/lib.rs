@@ -10,8 +10,9 @@
 //!
 //! It is built out of four things, and deliberately no more:
 //!
-//! - [`rules`] — the three rules that make Lux not Ethereum, as a value.
+//! - [`rules`] — the rules that make Lux not Ethereum, as a value.
 //! - [`handler`] — those rules in the two places revm asks about them.
+//! - [`gas`] — what a transaction owes before it runs.
 //! - [`precompile`] — the stock precompiles behind the classical-family gate.
 //! - [`header`] and [`root`] — how a block is named and what it commits to.
 //!
@@ -31,6 +32,7 @@
 //! let _ = Precompiles::new(SpecId::SHANGHAI, Profile::default());
 //! ```
 
+pub mod gas;
 pub mod handler;
 pub mod header;
 pub mod precompile;
