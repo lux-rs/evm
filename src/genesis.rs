@@ -10,12 +10,13 @@
 //! check against the live network's answer.
 //!
 //! The check is worth stating plainly, because it is the one that says the
-//! state layer is real: a Lux node on network 36963 reports the genesis
-//! `stateRoot` as `0xe66e9ed3…`. That number is a Merkle-Patricia root over
-//! four accounts, one of which has code. If [`World`](crate::state::World)
-//! hashed accounts any other way — a digest over a sorted list, a serialised
-//! struct, a root that ignored the code hash — it would produce a different
-//! number and the node would have forked before it produced a block.
+//! state layer is real. `luxfi/genesis` records that the mainnet allocation
+//! hashes to `0x2d1cedac…` and seals to `0x3f4fa2a0…`, and a node running on
+//! this machine reports `0xe66e9ed3…` for the four-account network it was
+//! started with. Both numbers come out of [`World`](crate::state::World)
+//! unchanged. A root computed any other way — a digest over a sorted list, a
+//! serialised struct, a root that ignored the code hash — is a different
+//! number, and a node producing it forked before it produced a block.
 
 use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH};
 use alloy_primitives::{Address, Bloom, Bytes, B256, B64, U256};
