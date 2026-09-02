@@ -130,21 +130,33 @@ impl Genesis {
     }
 }
 
-/// The C-chain of Lux network 36963, as a live node is started with it.
-///
-/// Read out of the genesis document that node runs, so this is a transcription
-/// rather than a design. Every value here is checkable against
-/// `eth_getBlockByNumber("0x0")` on a running node, and the tests check them.
-pub fn lux() -> Genesis {
-    // `0x02…05` is the warp precompile's account: one byte of code, so it is
-    // not an empty account and does not fall out of the trie under EIP-161.
-    const WARP: Address = Address::new([
-        0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05,
-    ]);
+/// The warp precompile's account. One byte of code, so it is not an empty
+/// account and does not fall out of the trie under EIP-161.
+const WARP: Address = Address::new([
+    0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05,
+]);
 
+/// The two accounts every Lux network starts with.
+fn lux_alloc() -> Vec<(Address, Alloc)> {
+    vec![
+        (WARP, Alloc::contract(U256::ZERO, 1, Bytes::from_static(&[0x01]))),
+        (
+            Address::new(hex_address("9011E888251AB053B7bD1cdB598Db4f9DEd94714")),
+            Alloc::funded(u256_hex("193e5939a08ce9dbd480000000")),
+        ),
+    ]
+}
+
+/// The Lux C-chain, chain id 96369.
+///
+/// Transcribed from `luxfi/genesis@v1.16.19 configs/mainnet/cchain.json`, which
+/// is the document the Go node is started with. That module also records what
+/// the values are supposed to hash to, in `cchain.canonical.json`, and the
+/// tests here check against those numbers rather than against ours.
+pub fn mainnet() -> Genesis {
     Genesis {
-        chain_id: 36963,
-        timestamp: 0,
+        chain_id: 96369,
+        timestamp: 0x672485c2,
         gas_limit: 0xb71b00,
         difficulty: U256::ZERO,
         base_fee: 25_000_000_000,
@@ -152,21 +164,27 @@ pub fn lux() -> Genesis {
         extra_data: Bytes::new(),
         mix_hash: B256::ZERO,
         nonce: 0,
-        alloc: vec![
-            (WARP, Alloc::contract(U256::ZERO, 1, Bytes::from_static(&[0x01]))),
-            (
-                Address::new(hex_address("703D4227d58d0b6A20BD721c940CED170470f634")),
-                Alloc::funded(u256_hex("d3c21bcecceda1000000")),
-            ),
-            (
-                Address::new(hex_address("778237fd03e9b59f1803c87117a7b1cfbd7fc60e")),
-                Alloc::funded(u256_hex("3635c9adc5dea00000")),
-            ),
-            (
-                Address::new(hex_address("9011E888251AB053B7bD1cdB598Db4f9DEd94714")),
-                Alloc::funded(u256_hex("de24aac7eb3e705b4e0000000")),
-            ),
-        ],
+        alloc: lux_alloc(),
+    }
+}
+
+/// The Lux localnet C-chain, chain id 31337 — `0x7a69`.
+///
+/// `configs/localnet/cchain.json`. The chain id is the one a local development
+/// network answers `eth_chainId` with, and it is NOT the mainnet id: a node
+/// that compiles either one in is a node that cannot be pointed at the other.
+pub fn localnet() -> Genesis {
+    Genesis {
+        chain_id: 31337,
+        timestamp: 0x6a065656,
+        gas_limit: 0xb71b00,
+        difficulty: U256::ZERO,
+        base_fee: 1_000_000_000,
+        coinbase: Address::ZERO,
+        extra_data: Bytes::new(),
+        mix_hash: B256::ZERO,
+        nonce: 0,
+        alloc: lux_alloc(),
     }
 }
 
@@ -190,53 +208,97 @@ mod tests {
     use super::*;
     use alloy_primitives::b256;
 
-    /// What a live Lux node on network 36963 reports for block zero. Captured
-    /// from `eth_getBlockByNumber("0x0")`; the same values are in the
-    /// `luxfi/conformance` corpus.
-    const STATE_ROOT: B256 =
-        b256!("e66e9ed33175518345f38838fdc70ba71cd4df8090eb2625ca298eb1b779449e");
-    const HASH: B256 = b256!("b4a9545d78d14a5582f390db08112752637243b9e76d594dea51a34d8bc79dc1");
+    /// What `luxfi/genesis configs/mainnet/cchain.canonical.json` records the
+    /// mainnet genesis is. Not our number — the Go module's own.
+    const MAINNET_STATE_ROOT: B256 =
+        b256!("2d1cedac263020c5c56ef962f6abe0da1f5217bdc6468f8c9258a0ea23699e80");
+    const MAINNET_HASH: B256 =
+        b256!("3f4fa2a0b0ce089f52bf0ae9199c75ffdd76ecafc987794050cb0d286f1ec61e");
 
     #[test]
-    fn the_allocation_hashes_to_the_root_the_network_reports() {
-        // The whole state layer in one number. Four accounts, one with code,
-        // hashed as a Merkle-Patricia trie over keccak(address) — and if any
-        // part of that is wrong this is a different number.
-        assert_eq!(lux().world().root(), STATE_ROOT);
+    fn the_mainnet_allocation_hashes_to_the_root_go_records() {
+        // The whole state layer in one number: two accounts, one with code,
+        // hashed as a Merkle-Patricia trie over keccak(address). Any other way
+        // of hashing them — a digest over a sorted list, a serialised struct,
+        // a root that ignores the code hash — is a different number and a
+        // chain that forked at genesis.
+        assert_eq!(mainnet().world().root(), MAINNET_STATE_ROOT);
     }
 
     #[test]
-    fn the_genesis_block_has_the_name_the_network_calls_it() {
-        assert_eq!(lux().hash(), HASH);
+    fn the_mainnet_genesis_block_has_the_name_go_records() {
+        assert_eq!(mainnet().hash(), MAINNET_HASH);
     }
 
     #[test]
-    fn the_genesis_header_is_the_london_shape() {
-        assert!(header::is_london(&lux().header()));
+    fn localnet_is_the_same_state_at_a_different_chain_id() {
+        // The allocation is shared, so the state root is the same number; the
+        // header is not, because the timestamp and base fee differ. This is
+        // the check that says chain id lives in the config and not in the
+        // state.
+        assert_eq!(localnet().world().root(), MAINNET_STATE_ROOT);
+        assert_ne!(localnet().hash(), MAINNET_HASH);
+        assert_eq!(localnet().chain_id, 31337, "0x7a69");
+        assert_eq!(mainnet().chain_id, 96369);
     }
 
     #[test]
-    fn the_allocation_is_four_accounts_and_the_warp_account_has_code() {
-        let w = lux().world();
-        assert_eq!(w.len(), 4);
-        let warp = Address::new([
-            0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05,
-        ]);
-        assert_eq!(w.nonce(&warp), 1);
-        assert_ne!(
-            w.get(&warp).expect("warp account").code_hash,
-            Account::default().code_hash,
-            "an account with code does not hash to the empty code hash"
+    fn a_running_node_reports_the_root_this_code_computes() {
+        // A sovereign L1 on this machine runs network 36963 with a four-account
+        // allocation, and reports `stateRoot` 0xe66e9ed3… and block hash
+        // 0xb4a9545d… over JSON-RPC. Reproducing a LIVE node's numbers is a
+        // stronger claim than reproducing a file's: nothing here was copied
+        // from an implementation that could be wrong the same way.
+        let g = Genesis {
+            chain_id: 36963,
+            timestamp: 0,
+            base_fee: 25_000_000_000,
+            alloc: vec![
+                (WARP, Alloc::contract(U256::ZERO, 1, Bytes::from_static(&[0x01]))),
+                (
+                    Address::new(hex_address("703D4227d58d0b6A20BD721c940CED170470f634")),
+                    Alloc::funded(u256_hex("d3c21bcecceda1000000")),
+                ),
+                (
+                    Address::new(hex_address("778237fd03e9b59f1803c87117a7b1cfbd7fc60e")),
+                    Alloc::funded(u256_hex("3635c9adc5dea00000")),
+                ),
+                (
+                    Address::new(hex_address("9011E888251AB053B7bD1cdB598Db4f9DEd94714")),
+                    Alloc::funded(u256_hex("de24aac7eb3e705b4e0000000")),
+                ),
+            ],
+            ..mainnet()
+        };
+        assert_eq!(
+            g.world().root(),
+            b256!("e66e9ed33175518345f38838fdc70ba71cd4df8090eb2625ca298eb1b779449e")
+        );
+        assert_eq!(
+            g.hash(),
+            b256!("b4a9545d78d14a5582f390db08112752637243b9e76d594dea51a34d8bc79dc1")
         );
     }
 
     #[test]
-    fn dropping_the_code_changes_the_root() {
-        // Proof the code hash is load-bearing rather than decoration: the same
-        // four accounts with the warp account's code removed is a different
-        // state, and a node that ignored code would report this instead.
-        let mut g = lux();
+    fn the_genesis_header_is_the_london_shape() {
+        assert!(header::is_london(&mainnet().header()));
+    }
+
+    #[test]
+    fn the_warp_account_has_code_and_the_code_is_load_bearing() {
+        let w = mainnet().world();
+        assert_eq!(w.len(), 2);
+        assert_eq!(w.nonce(&WARP), 1);
+        assert_ne!(
+            w.get(&WARP).expect("warp account").code_hash,
+            Account::default().code_hash,
+            "an account with code does not hash to the empty code hash"
+        );
+
+        // Proof the code hash is not decoration: drop it and the root moves.
+        let mut g = mainnet();
         g.alloc[0].1.code = Bytes::new();
-        assert_ne!(g.world().root(), STATE_ROOT);
+        assert_ne!(g.world().root(), MAINNET_STATE_ROOT);
     }
 }

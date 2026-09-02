@@ -153,44 +153,7 @@ pub fn apply(
         }
     }
 
-    let txenv = to_revm(tx, sender);
-    let spec = env.spec;
-
-    // The context borrows the world for exactly this transaction. Access lists
-    // and warm slots are per-transaction state and are meant to be dropped
-    // here; what carries between transactions is committed state, which lives
-    // in the world.
-    let (result, state) = {
-        let ctx = Context::mainnet()
-            .with_db(&mut *world)
-            .modify_cfg_chained(|c| {
-                c.spec = spec;
-                c.chain_id = env.chain_id;
-            })
-            .modify_block_chained(|b| {
-                b.beneficiary = env.beneficiary;
-                b.timestamp = U256::from(env.timestamp);
-                b.basefee = env.base_fee;
-                b.gas_limit = env.gas_limit;
-                b.difficulty = env.difficulty;
-                b.prevrandao = Some(env.mix_hash);
-            });
-        let mut evm = Evm::new(
-            ctx,
-            EthInstructions::new_mainnet_with_spec(spec),
-            Precompiles::new(spec, env.profile),
-        );
-        evm.ctx.set_tx(txenv);
-
-        let mut handler: Handler<_, EVMError<core::convert::Infallible>, _> =
-            Handler::new(env.chain);
-        let result: ExecutionResult = handler
-            .run(&mut evm)
-            .map_err(|e| Invalid::Rejected(format!("{e:?}")))?;
-        let state = evm.ctx.journal_mut().finalize();
-        (result, state)
-    };
-
+    let (result, state) = run(world, env, to_revm(tx, sender))?;
     let gas_used = result.gas_used();
     if cumulative.saturating_add(gas_used) > env.gas_limit {
         // Refused after running, because whether it fits is only known once the
@@ -223,6 +186,58 @@ pub fn apply(
         output,
         created,
     })
+}
+
+/// Drive the interpreter once. The ONE place execution happens.
+///
+/// Returns what the transaction did and the state it would leave behind —
+/// separately, because whether that state is kept is the caller's decision and
+/// not the interpreter's. [`apply`] keeps it; [`call`] throws it away.
+pub fn run(
+    world: &mut World,
+    env: &Env,
+    tx: TxEnv,
+) -> Result<(ExecutionResult, revm::state::EvmState), Invalid> {
+    let spec = env.spec;
+    // The context borrows the world for exactly this transaction. Access lists
+    // and warm slots are per-transaction state and are meant to be dropped
+    // here; what carries between transactions is committed state, which lives
+    // in the world.
+    let ctx = Context::mainnet()
+        .with_db(&mut *world)
+        .modify_cfg_chained(|c| {
+            c.spec = spec;
+            c.chain_id = env.chain_id;
+        })
+        .modify_block_chained(|b| {
+            b.beneficiary = env.beneficiary;
+            b.timestamp = U256::from(env.timestamp);
+            b.basefee = env.base_fee;
+            b.gas_limit = env.gas_limit;
+            b.difficulty = env.difficulty;
+            b.prevrandao = Some(env.mix_hash);
+        });
+    let mut evm = Evm::new(
+        ctx,
+        EthInstructions::new_mainnet_with_spec(spec),
+        Precompiles::new(spec, env.profile),
+    );
+    evm.ctx.set_tx(tx);
+
+    let mut handler: Handler<_, EVMError<core::convert::Infallible>, _> = Handler::new(env.chain);
+    let result: ExecutionResult = handler
+        .run(&mut evm)
+        .map_err(|e| Invalid::Rejected(format!("{e:?}")))?;
+    let state = evm.ctx.journal_mut().finalize();
+    Ok((result, state))
+}
+
+/// Run a transaction and keep nothing — `eth_call`.
+///
+/// The world is taken by value so the discarding is structural: there is no
+/// path from here that could commit, because the caller handed over a copy.
+pub fn call(mut world: World, env: &Env, tx: TxEnv) -> Result<ExecutionResult, Invalid> {
+    run(&mut world, env, tx).map(|(result, _)| result)
 }
 
 /// A block, and everything needed to serve it.
@@ -397,7 +412,7 @@ mod tests {
         let who = who();
         let g = genesis::Genesis {
             alloc: vec![(who, genesis::Alloc::funded(U256::from(10u64).pow(U256::from(21u64))))],
-            ..genesis::lux()
+            ..genesis::mainnet()
         };
         let env = Env {
             beneficiary: address!("00000000000000000000000000000000000000c0"),
@@ -488,7 +503,7 @@ mod tests {
 
     #[test]
     fn a_repeated_nonce_is_refused_and_leaves_no_trace() {
-        let (mut world, parent, env, _) = chain();
+        let (mut world, _parent, env, _) = chain();
         let one = send(0, env.chain_id, U256::from(1u64));
         let done = apply(&mut world, &env, 0, &one.0, one.1).expect("first");
         assert!(done.success);
@@ -540,6 +555,63 @@ mod tests {
             paid,
             U256::from(built.header.gas_used as u128 * 26_000_000_000u128)
         );
+    }
+
+    #[test]
+    fn the_sha256_precompile_returns_the_digest_anyone_else_computes() {
+        // Real bytecode execution, checked against a value that has nothing to
+        // do with this codebase: SHA-256("abc") is a published constant.
+        let (world, env, _) = {
+            let (w, _p, e, who) = chain();
+            (w, e, who)
+        };
+        let out = call(
+            world,
+            &env,
+            TxEnv::builder()
+                .caller(who())
+                .kind(TxKind::Call(Address::from_slice(&{
+                    let mut a = [0u8; 20];
+                    a[19] = 2;
+                    a
+                })))
+                .gas_limit(100_000)
+                .gas_price(env.base_fee as u128)
+                .data(Bytes::from_static(b"abc"))
+                .nonce(0)
+                // A call is not signed, so it carries no EIP-155 binding.
+                .chain_id(None)
+                .build_fill(),
+        )
+        .expect("the call runs");
+        assert!(out.is_success(), "{out:?}");
+        assert_eq!(
+            alloy_primitives::hex::encode(out.into_output().unwrap_or_default()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "SHA-256(\"abc\")"
+        );
+    }
+
+    #[test]
+    fn a_call_keeps_nothing() {
+        let (world, _parent, env, _) = chain();
+        let before = world.root();
+        let _ = call(
+            world.clone(),
+            &env,
+            TxEnv::builder()
+                .caller(who())
+                .kind(TxKind::Call(TO))
+                .gas_limit(100_000)
+                .gas_price(env.base_fee as u128)
+                .value(U256::from(1u64))
+                .nonce(0)
+                .chain_id(None)
+                .build_fill(),
+        )
+        .expect("runs");
+        assert_eq!(world.root(), before, "a call is not a transaction");
+        assert_eq!(world.balance(&TO), U256::ZERO);
     }
 
     #[test]
