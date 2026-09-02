@@ -11,7 +11,15 @@ publish = false
 # The machine. Not forked: a fork of an interpreter is a second interpreter to
 # keep in step with two other languages. Everything Lux changes is reachable
 # through revm's own seams — a PrecompileProvider and two Handler methods.
-revm = "36"
+# The three `optional_*` features are what `eth_call` needs and nothing else
+# does. They add fields that default to false, so consensus execution is
+# untouched; `block::Checks` is the only thing that ever sets them, and it can
+# only be reached through `block::call`, which takes the world by value.
+revm = { version = "36", features = [
+    "optional_balance_check",
+    "optional_no_base_fee",
+    "optional_eip3607",
+] }
 
 # The encodings the network is defined over. A header is keccak of its RLP and
 # a root is a Merkle-Patricia trie; both are already written down correctly in

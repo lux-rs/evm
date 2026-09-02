@@ -153,7 +153,7 @@ pub fn apply(
         }
     }
 
-    let (result, state) = run(world, env, to_revm(tx, sender))?;
+    let (result, state) = run(world, env, to_revm(tx, sender), Checks::All)?;
     let gas_used = result.gas_used();
     if cumulative.saturating_add(gas_used) > env.gas_limit {
         // Refused after running, because whether it fits is only known once the
@@ -188,6 +188,22 @@ pub fn apply(
     })
 }
 
+/// Which rules a run is subject to.
+///
+/// Not a flag: the two are different questions. Consensus asks "may this
+/// transaction be in a block", where paying for gas is the point. A simulation
+/// asks "what would this do", where the caller is not paying and a balance is
+/// not part of the question — `eth_call` from an address holding nothing is the
+/// normal case, not an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Checks {
+    /// Every rule. What a block is verified under.
+    All,
+    /// The rules about being able to pay are set aside, and nothing else is.
+    /// Only ever reachable through [`call`], which cannot commit.
+    Simulated,
+}
+
 /// Drive the interpreter once. The ONE place execution happens.
 ///
 /// Returns what the transaction did and the state it would leave behind —
@@ -197,8 +213,10 @@ pub fn run(
     world: &mut World,
     env: &Env,
     tx: TxEnv,
+    checks: Checks,
 ) -> Result<(ExecutionResult, revm::state::EvmState), Invalid> {
     let spec = env.spec;
+    let relaxed = checks == Checks::Simulated;
     // The context borrows the world for exactly this transaction. Access lists
     // and warm slots are per-transaction state and are meant to be dropped
     // here; what carries between transactions is committed state, which lives
@@ -208,6 +226,13 @@ pub fn run(
         .modify_cfg_chained(|c| {
             c.spec = spec;
             c.chain_id = env.chain_id;
+            // A simulation is not paying, so the fee gates are not its
+            // question. Every other rule — gas metering, the interpreter, the
+            // precompile set — is untouched.
+            c.disable_balance_check = relaxed;
+            c.disable_base_fee = relaxed;
+            c.disable_nonce_check = relaxed;
+            c.disable_eip3607 = relaxed;
         })
         .modify_block_chained(|b| {
             b.beneficiary = env.beneficiary;
@@ -237,7 +262,7 @@ pub fn run(
 /// The world is taken by value so the discarding is structural: there is no
 /// path from here that could commit, because the caller handed over a copy.
 pub fn call(mut world: World, env: &Env, tx: TxEnv) -> Result<ExecutionResult, Invalid> {
-    run(&mut world, env, tx).map(|(result, _)| result)
+    run(&mut world, env, tx, Checks::Simulated).map(|(result, _)| result)
 }
 
 /// A block, and everything needed to serve it.
@@ -590,6 +615,46 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
             "SHA-256(\"abc\")"
         );
+    }
+
+    #[test]
+    fn consensus_still_refuses_a_sender_that_cannot_pay() {
+        // The guard on the simulation relaxation: `Checks::All` is what a block
+        // is verified under, and enabling revm's optional_* features must not
+        // have loosened it. An account with nothing cannot send a transaction.
+        let (mut world, _parent, env, _) = chain();
+        let broke = address!("00000000000000000000000000000000000000bb");
+        let refused = run(
+            &mut world,
+            &env,
+            TxEnv::builder()
+                .caller(broke)
+                .kind(TxKind::Call(TO))
+                .gas_limit(100_000)
+                .gas_price(30_000_000_000u128)
+                .nonce(0)
+                .chain_id(Some(env.chain_id))
+                .build_fill(),
+            Checks::All,
+        );
+        assert!(
+            matches!(&refused, Err(Invalid::Rejected(why)) if why.contains("LackOfFundForMaxFee")),
+            "{refused:?}"
+        );
+        // And the same transaction simulates fine, which is the whole point of
+        // there being two answers.
+        assert!(call(
+            world,
+            &env,
+            TxEnv::builder()
+                .caller(broke)
+                .kind(TxKind::Call(TO))
+                .gas_limit(100_000)
+                .nonce(0)
+                .chain_id(None)
+                .build_fill()
+        )
+        .is_ok());
     }
 
     #[test]
