@@ -34,6 +34,7 @@ dependencies = [
  "auto_impl",
  "derive_more",
  "either",
+ "k256",
  "once_cell",
  "thiserror",
 ]
@@ -1642,6 +1643,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "sha2",
+ "signature",
 ]
 
 [[package]]
@@ -1702,9 +1704,11 @@ name = "lux-evm"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips 2.4.1",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
+ "k256",
  "revm",
  "serde_json",
 ]

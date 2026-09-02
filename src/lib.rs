@@ -32,13 +32,19 @@
 //! let _ = Precompiles::new(SpecId::SHANGHAI, Profile::default());
 //! ```
 
+pub mod block;
 pub mod gas;
+pub mod genesis;
 pub mod handler;
 pub mod header;
 pub mod precompile;
 pub mod root;
 pub mod rules;
+pub mod state;
 
+pub use block::{Built, Env, Invalid};
+pub use genesis::{Alloc, Genesis};
 pub use handler::Handler;
 pub use precompile::{Op, Precompiles, Profile};
 pub use rules::{Chain, Rules};
+pub use state::{Account, World};
