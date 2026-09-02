@@ -125,9 +125,14 @@ impl Genesis {
         }
     }
 
+    /// Block zero, in the sixteen-field shape only the genesis has.
+    pub fn sealed(&self) -> header::Lux {
+        header::Lux::genesis(self.header())
+    }
+
     /// The hash the network calls block zero.
     pub fn hash(&self) -> B256 {
-        header::seal(&self.header())
+        self.sealed().seal()
     }
 }
 

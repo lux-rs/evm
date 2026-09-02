@@ -64,6 +64,16 @@ pub struct Env {
     pub difficulty: U256,
     pub extra_data: Bytes,
     pub mix_hash: B256,
+    /// The seventeenth header field.
+    ///
+    /// SUPPLIED, NOT DERIVED. Go computes it from the fee schedule —
+    /// `minBlockGasCost`, `maxBlockGasCost`, `blockGasCostStep` and how long
+    /// the parent took — and that schedule is not modelled here. Every network
+    /// whose genesis this crate carries sets all three to zero, which makes the
+    /// value zero for every block, and the mainnet header history agrees: block
+    /// 1 through 1,082,780 all carry zero. A network with a non-zero schedule
+    /// needs the formula before this can be right for it.
+    pub block_gas_cost: U256,
 }
 
 impl Env {
@@ -81,6 +91,7 @@ impl Env {
             difficulty: U256::ZERO,
             extra_data: Bytes::new(),
             mix_hash: B256::ZERO,
+            block_gas_cost: U256::ZERO,
         }
     }
 }
@@ -268,7 +279,10 @@ pub fn call(mut world: World, env: &Env, tx: TxEnv) -> Result<ExecutionResult, I
 /// A block, and everything needed to serve it.
 #[derive(Clone, Debug)]
 pub struct Built {
-    pub header: Header,
+    /// The header in the shape the chain accepts: sixteen fields at genesis,
+    /// seventeen after. See [`crate::header`] for why that is not one layout
+    /// with an optional field.
+    pub header: header::Lux,
     pub transactions: Vec<TxEnvelope>,
     pub receipts: Vec<ReceiptEnvelope>,
 }
@@ -276,7 +290,12 @@ pub struct Built {
 impl Built {
     /// The block's hash: keccak of its header's RLP, and nothing else.
     pub fn hash(&self) -> B256 {
-        header::seal(&self.header)
+        self.header.seal()
+    }
+
+    /// The Ethereum fields, for everything that does not care about the shape.
+    pub fn fields(&self) -> &Header {
+        &self.header.header
     }
 }
 
@@ -287,7 +306,7 @@ impl Built {
 /// policy about a mempool and not a property of execution.
 pub fn execute(
     world: &mut World,
-    parent: &Header,
+    parent: &header::Lux,
     env: &Env,
     txs: Vec<(TxEnvelope, Address)>,
 ) -> Result<Built, Invalid> {
@@ -312,7 +331,7 @@ pub fn execute(
 /// what a block commits to means a proposer and a verifier cannot drift.
 pub fn finish(
     world: &World,
-    parent: &Header,
+    parent: &header::Lux,
     env: &Env,
     transactions: Vec<TxEnvelope>,
     receipts: Vec<ReceiptEnvelope>,
@@ -324,8 +343,8 @@ pub fn finish(
         .iter()
         .fold(Bloom::ZERO, |acc, r| acc | bloom_of(r));
 
-    let header = Header {
-        parent_hash: header::seal(parent),
+    let fields = Header {
+        parent_hash: parent.seal(),
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
         beneficiary: env.beneficiary,
         state_root: world.root(),
@@ -333,7 +352,7 @@ pub fn finish(
         receipts_root: root::receipts(&receipts_encoded),
         logs_bloom,
         difficulty: env.difficulty,
-        number: parent.number + 1,
+        number: parent.header.number + 1,
         gas_limit: env.gas_limit,
         gas_used,
         timestamp: env.timestamp,
@@ -341,12 +360,15 @@ pub fn finish(
         mix_hash: env.mix_hash,
         nonce: B64::ZERO,
         base_fee_per_gas: Some(env.base_fee),
-        // London's field set, like the genesis: the C-chain seals sixteen
-        // fields whatever later forks are active.
+        // No post-London tail: on this chain the seventeenth field is
+        // `blockGasCost`, and a header carrying both shapes is one no node has
+        // ever accepted.
         ..Default::default()
     };
     Built {
-        header,
+        // Every block but the genesis carries the Lux field. The genesis is
+        // built by `genesis::Genesis`, never here.
+        header: header::Lux::block(fields, env.block_gas_cost),
         transactions,
         receipts,
     }
@@ -433,7 +455,7 @@ mod tests {
     }
 
     /// A funded world, and the environment its blocks run under.
-    fn chain() -> (World, Header, Env, Address) {
+    fn chain() -> (World, header::Lux, Env, Address) {
         let who = who();
         let g = genesis::Genesis {
             alloc: vec![(who, genesis::Alloc::funded(U256::from(10u64).pow(U256::from(21u64))))],
@@ -443,7 +465,7 @@ mod tests {
             beneficiary: address!("00000000000000000000000000000000000000c0"),
             ..Env::lux(g.chain_id, g.base_fee, g.gas_limit)
         };
-        (g.world(), g.header(), env, who)
+        (g.world(), g.sealed(), env, who)
     }
 
     fn send(nonce: u64, chain_id: u64, value: U256) -> (TxEnvelope, Address) {
@@ -470,17 +492,17 @@ mod tests {
         let built = execute(&mut world, &parent, &env, vec![send(0, env.chain_id, value)])
             .expect("the block executes");
 
-        assert_eq!(built.header.number, 1);
-        assert_eq!(built.header.parent_hash, header::seal(&parent));
+        assert_eq!(built.fields().number, 1);
+        assert_eq!(built.fields().parent_hash, parent.seal());
         assert_eq!(world.balance(&TO), value, "the transfer landed");
         assert_eq!(world.nonce(&who), 1, "the sender's nonce advanced");
-        assert_ne!(built.header.state_root, before, "the state moved");
+        assert_ne!(built.fields().state_root, before, "the state moved");
         assert_eq!(
-            built.header.state_root,
+            built.fields().state_root,
             world.root(),
             "the header commits to the world that actually resulted"
         );
-        assert_eq!(built.header.gas_used, 21_000);
+        assert_eq!(built.fields().gas_used, 21_000);
     }
 
     #[test]
@@ -493,8 +515,8 @@ mod tests {
             vec![send(0, env.chain_id, U256::from(1u64))],
         )
         .expect("executes");
-        assert_ne!(built.header.transactions_root, root::EMPTY);
-        assert_ne!(built.header.receipts_root, root::EMPTY);
+        assert_ne!(built.fields().transactions_root, root::EMPTY);
+        assert_ne!(built.fields().receipts_root, root::EMPTY);
         assert_eq!(built.receipts.len(), 1);
     }
 
@@ -502,12 +524,12 @@ mod tests {
     fn an_empty_block_still_advances_and_keeps_the_empty_roots() {
         let (mut world, parent, env, _) = chain();
         let built = execute(&mut world, &parent, &env, vec![]).expect("executes");
-        assert_eq!(built.header.number, 1);
-        assert_eq!(built.header.gas_used, 0);
-        assert_eq!(built.header.transactions_root, root::EMPTY);
-        assert_eq!(built.header.receipts_root, root::EMPTY);
+        assert_eq!(built.fields().number, 1);
+        assert_eq!(built.fields().gas_used, 0);
+        assert_eq!(built.fields().transactions_root, root::EMPTY);
+        assert_eq!(built.fields().receipts_root, root::EMPTY);
         assert_eq!(
-            built.header.state_root, parent.state_root,
+            built.fields().state_root, parent.header.state_root,
             "nothing ran, so nothing changed"
         );
     }
@@ -557,9 +579,9 @@ mod tests {
         )
         .expect("second");
 
-        assert_eq!(second.header.number, 2);
-        assert_eq!(second.header.parent_hash, first.hash());
-        assert_ne!(second.header.state_root, first.header.state_root);
+        assert_eq!(second.fields().number, 2);
+        assert_eq!(second.fields().parent_hash, first.hash());
+        assert_ne!(second.fields().state_root, first.fields().state_root);
         assert_eq!(world.balance(&TO), U256::from(2u64));
     }
 
@@ -578,7 +600,7 @@ mod tests {
         let paid = world.balance(&env.beneficiary);
         assert_eq!(
             paid,
-            U256::from(built.header.gas_used as u128 * 26_000_000_000u128)
+            U256::from(built.fields().gas_used as u128 * 26_000_000_000u128)
         );
     }
 
@@ -677,6 +699,94 @@ mod tests {
         .expect("runs");
         assert_eq!(world.root(), before, "a call is not a transaction");
         assert_eq!(world.balance(&TO), U256::ZERO);
+    }
+
+    /// One receipt, so each field can be moved on its own.
+    fn one_receipt(ty: TxType, success: bool, cumulative: u64, logs: Vec<Log>) -> ReceiptEnvelope {
+        envelope(
+            ty,
+            Receipt {
+                status: Eip658Value::Eip658(success),
+                cumulative_gas_used: cumulative,
+                logs,
+            },
+        )
+    }
+
+    fn receipts_root(rs: &[ReceiptEnvelope]) -> B256 {
+        let encoded: Vec<Vec<u8>> = rs.iter().map(|r| r.encoded_2718()).collect();
+        root::receipts(&encoded)
+    }
+
+    #[test]
+    fn every_field_a_receipt_commits_to_moves_the_receipts_root() {
+        // The root is a commitment, and a commitment that ignores a field is a
+        // field two chains can disagree about while agreeing on the block. Each
+        // of these was a mutation the tests here used to sleep through.
+        let log = Log::new_unchecked(
+            TO,
+            vec![B256::repeat_byte(0x11)],
+            Bytes::from_static(b"data"),
+        );
+        let base = one_receipt(TxType::Eip1559, true, 21_000, vec![log.clone()]);
+        let root_of = |r: &ReceiptEnvelope| receipts_root(std::slice::from_ref(r));
+        let want = root_of(&base);
+
+        assert_ne!(
+            want,
+            root_of(&one_receipt(TxType::Legacy, true, 21_000, vec![log.clone()])),
+            "the type flag is part of the 2718 envelope the trie commits to"
+        );
+        assert_ne!(
+            want,
+            root_of(&one_receipt(TxType::Eip1559, false, 21_000, vec![log.clone()])),
+            "success and failure are different receipts"
+        );
+        assert_ne!(
+            want,
+            root_of(&one_receipt(TxType::Eip1559, true, 21_001, vec![log.clone()])),
+            "cumulative gas is committed to"
+        );
+        assert_ne!(
+            want,
+            root_of(&one_receipt(TxType::Eip1559, true, 21_000, vec![])),
+            "dropping the logs is a different receipt"
+        );
+
+        // And the bloom is not decoration: it is inside the encoding, so a
+        // receipt whose bloom was zeroed does not hash to the same value.
+        let mut blanked = match base.clone() {
+            ReceiptEnvelope::Eip1559(mut r) => {
+                r.logs_bloom = Bloom::ZERO;
+                ReceiptEnvelope::Eip1559(r)
+            }
+            other => other,
+        };
+        assert_ne!(want, root_of(&blanked), "the logs bloom is committed to");
+        blanked = base.clone();
+        assert_eq!(want, root_of(&blanked), "and the unchanged receipt still matches");
+    }
+
+    #[test]
+    fn a_receipt_in_another_position_is_another_root() {
+        let a = one_receipt(TxType::Eip1559, true, 21_000, vec![]);
+        let b = one_receipt(TxType::Eip1559, true, 42_000, vec![]);
+        assert_ne!(
+            receipts_root(&[a.clone(), b.clone()]),
+            receipts_root(&[b, a]),
+            "position is part of the commitment"
+        );
+    }
+
+    #[test]
+    fn the_block_bloom_is_the_or_of_its_receipts() {
+        // The header's bloom has to be derivable from the receipts, or a node
+        // could serve a block whose bloom answers filters the receipts do not.
+        let log = Log::new_unchecked(TO, vec![B256::repeat_byte(0x22)], Bytes::new());
+        let r = one_receipt(TxType::Eip1559, true, 21_000, vec![log]);
+        let folded = [r.clone()].iter().fold(Bloom::ZERO, |acc, x| acc | bloom_of(x));
+        assert_eq!(folded, bloom_of(&r));
+        assert_ne!(folded, Bloom::ZERO, "a receipt with a log has a bloom");
     }
 
     #[test]
