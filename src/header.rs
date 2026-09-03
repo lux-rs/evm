@@ -166,6 +166,17 @@ impl Lux {
     }
 }
 
+/// A header's parent, for callers that hold only the header.
+pub trait ParentOf {
+    fn parent_canonical(&self) -> [u8; 32];
+}
+
+impl ParentOf for Header {
+    fn parent_canonical(&self) -> [u8; 32] {
+        self.parent_hash.0
+    }
+}
+
 impl Encodable for Lux {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         out.put_slice(&self.encoded());
@@ -192,6 +203,14 @@ impl Decodable for Lux {
         *buf = &buf[consumed..];
         Ok(out)
     }
+}
+
+/// The name of a header already in its encoded form.
+///
+/// A block that arrived on the wire is bytes, and re-encoding a decoded header
+/// to name it is a chance to name it differently. Hashing what arrived cannot.
+pub fn seal_bytes(rlp: &[u8]) -> B256 {
+    keccak256(rlp)
 }
 
 /// The block hash of a header with no Lux field: keccak256 of its RLP.
