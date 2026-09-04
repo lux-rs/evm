@@ -194,6 +194,22 @@ pub fn localnet() -> Genesis {
     }
 }
 
+/// The Lux testnet C-chain, chain id 96300.
+pub fn testnet() -> Genesis {
+    Genesis {
+        chain_id: 96300,
+        timestamp: 0x672485c2,
+        gas_limit: 0xb71b00,
+        difficulty: U256::ZERO,
+        base_fee: 25_000_000_000,
+        coinbase: Address::ZERO,
+        extra_data: Bytes::new(),
+        mix_hash: B256::ZERO,
+        nonce: 0,
+        alloc: lux_alloc(),
+    }
+}
+
 /// A 20-byte address from its hex digits, at compile time in spirit and at
 /// startup in fact. Panics on a malformed literal, which is a bug in this file
 /// and not a runtime condition.
