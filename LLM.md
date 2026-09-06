@@ -9,7 +9,7 @@ names a block the way the network names it.
 - `src/rules.rs` — the four rules that make Lux not Ethereum, as one value.
 - `src/handler.rs` — those rules in the two places revm asks about them.
 - `src/gas.rs` — what a transaction owes before it runs.
-- `src/precompile.rs` — the stock precompiles behind the classical-family gate.
+- `src/precompile.rs` — which precompile answers where, and at what price.
 - `src/state.rs` — the world the roots are taken over.
 - `src/block.rs` — `run` (the ONE interpreter call), `apply`, `execute`, `call`.
 - `src/header.rs` — the three shapes a C-chain header has, and their RLP.
@@ -60,3 +60,44 @@ names a block the way the network names it.
 
 - **chainId is genesis data.** Mainnet 96369, localnet 31337. A node that
   compiles one in replays onto whichever network it was built for.
+
+- **The C-chain's BLS12-381 is the PRE-FINAL EIP-2537 assignment.** G1Add,
+  G1Mul, G1MSM, G2Add, G2Mul, G2MSM, Pairing at 0x0b–0x11
+  (`luxfi/precompile@v0.19.21 bls12381/contract.go`). revm's set is the final
+  one, so from 0x0c onward the same address names a different operation in
+  each: 0x0d is a G1 multi-scalar multiplication to the chain and a G2 addition
+  to revm. The chain has no map-to-curve precompile at all. Mainnet has had all
+  seven since 2025-12-26 and changing them is a hard fork, so the port follows
+  the chain rather than the EIP.
+
+- **A module SHADOWS the Ethereum precompile at its address.** Go asks
+  `LuxPrecompileOverrider` before the standard table, so at an address both
+  claim the standard table never answers.
+
+- **Registered is not enabled.** The Go registry holds ~56 modules; a chain
+  serves only the ones its `upgrade.json` lists under `precompileUpgrades`.
+  Every Lux network lists the seven BLS keys; none lists `secp256r1Config`, so
+  0x0100 answers nothing on any Lux chain and is deliberately absent from
+  `MODULES`. The precompile differential's Go evaluator asks the registry
+  rather than an enabled set and therefore serves 0x0100 at 3450 — a price no
+  Lux chain charges. That is a fact about the harness, not about a chain.
+
+- **A module is outside the classical gate.** `opForPrecompile` type-switches
+  on the implementation and has no case for the `precompileAdapter` an
+  overrider installs, so every module falls to `Op::Unknown`, which no profile
+  refuses. The consequence is real and is Go's: a strict-PQ chain still serves
+  BLS12-381 at 0x0b–0x11.
+
+- **Price and work are stated apart, because Go deducts before it reads.**
+  `contract.DeductGas` runs at the top of every module's `Run`, so a call that
+  reads its input and then refuses it has still paid. revm computes a
+  precompile's price inside the function that does the work and its error
+  carries no charge, so `Module` keeps `gas` and `run` as two fields.
+
+- **Go checks the BLS subgroup on the additions and the final EIP-2537 does
+  not.** One `decodeG1`/`decodeG2` serves all seven Go operations and both
+  check `IsInSubGroup`; revm's `g1_add`/`g2_add` follow the final text and skip
+  it. An on-curve point outside the r-order subgroup is therefore accepted by
+  revm and refused by the chain. `subgroup_g1`/`subgroup_g2` close that by
+  handing the point to revm's MSM with a zero scalar, which validates it and
+  then computes nothing.

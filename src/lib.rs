@@ -13,7 +13,7 @@
 //! - [`rules`] — the rules that make Lux not Ethereum, as a value.
 //! - [`handler`] — those rules in the two places revm asks about them.
 //! - [`gas`] — what a transaction owes before it runs.
-//! - [`precompile`] — the stock precompiles behind the classical-family gate.
+//! - [`precompile`] — which precompile answers where, and at what price.
 //! - [`header`] and [`root`] — how a block is named and what it commits to.
 //!
 //! revm is a dependency, not a fork. Three implementations of one protocol are
@@ -45,6 +45,6 @@ pub mod state;
 pub use block::{Built, Env, Invalid};
 pub use genesis::{Alloc, Genesis};
 pub use handler::Handler;
-pub use precompile::{Op, Precompiles, Profile};
+pub use precompile::{Module, Op, Precompiles, Profile};
 pub use rules::{Chain, Rules};
 pub use state::{Account, World};
