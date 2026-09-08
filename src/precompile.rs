@@ -269,10 +269,16 @@ const fn at(n: u16) -> Address {
     Address::new(a)
 }
 
-/// What a module charges. Every price below is EIP-2537's or RIP-7212's, and
-/// revm already writes each number down; Go's `bls12381/contract.go` and
-/// `secp256r1/contract.go` name the same values, so these read revm's rather
-/// than start a second table that could drift from it.
+/// What a module charges. Every price below is EIP-2537's, and revm already
+/// writes each number down; Go's `bls12381/contract.go` names the same values,
+/// so these read revm's rather than start a second table that could drift from
+/// it.
+///
+/// That reasoning holds here because both sides price EIP-2537 alike. It does
+/// not generalise, and 0x0100 is where it breaks: Go's `secp256r1/contract.go`
+/// charges 3450 for RIP-7212 where revm's Osaka table charges EIP-7951's 6900.
+/// Neither number reaches a chain — see [`MODULES`] — so no price for it is
+/// written down anywhere, here least of all.
 mod price {
     use super::*;
 
