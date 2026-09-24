@@ -23,9 +23,13 @@ use alloy_primitives::{Address, Bloom, Bytes, B256, B64, U256};
 use revm::bytecode::Bytecode;
 use revm::primitives::{StorageKey, StorageValue};
 
+use crate::block::Env;
+use crate::fee;
 use crate::header;
 use crate::root;
+use crate::rules::{Chain, WARP};
 use crate::state::{Account, World};
+use crate::Profile;
 
 /// One account the chain begins with.
 #[derive(Clone, Debug, Default)]
@@ -59,10 +63,15 @@ impl Alloc {
 /// The document a chain starts from.
 ///
 /// The field names are the genesis JSON's, so a reader holding the file can
-/// check them off one at a time.
+/// check them off one at a time. `chain`, `fee` and `allow_fee_recipients` are
+/// its `config`: when each Lux upgrade turns on, `feeConfig`, and
+/// `allowFeeRecipients`. Every block after the genesis is derived from them.
 #[derive(Clone, Debug)]
 pub struct Genesis {
     pub chain_id: u64,
+    pub chain: Chain,
+    pub fee: fee::Config,
+    pub allow_fee_recipients: bool,
     pub timestamp: u64,
     pub gas_limit: u64,
     pub difficulty: U256,
@@ -134,18 +143,41 @@ impl Genesis {
     pub fn hash(&self) -> B256 {
         self.sealed().seal()
     }
+
+    /// The environment this chain's blocks run under. Its per-block fields are
+    /// the first block's; [`Env::next`] derives every block's from its parent.
+    pub fn env(&self) -> Env {
+        Env {
+            chain: self.chain,
+            chain_id: self.chain_id,
+            spec: revm::primitives::hardfork::SpecId::SHANGHAI,
+            profile: Profile::default(),
+            fee: self.fee,
+            allow_fee_recipients: self.allow_fee_recipients,
+            beneficiary: fee::BLACKHOLE,
+            timestamp: self.timestamp,
+            gas_limit: self.fee.gas_limit,
+            base_fee: self.fee.min_base_fee,
+            difficulty: U256::from(1u64),
+            extra_data: fee::extra(
+                &fee::Window::default(),
+                self.chain.at(self.timestamp).durango,
+            ),
+            mix_hash: B256::ZERO,
+            block_gas_cost: self.fee.min_block_gas_cost,
+        }
+    }
 }
 
-/// The warp precompile's account. One byte of code, so it is not an empty
-/// account and does not fall out of the trie under EIP-161.
-const WARP: Address = Address::new([
-    0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05,
-]);
-
-/// The two accounts every Lux network starts with.
+/// The two accounts every Lux network starts with. The warp precompile's
+/// carries one byte of code, so it is not an empty account and does not fall
+/// out of the trie under EIP-161.
 fn lux_alloc() -> Vec<(Address, Alloc)> {
     vec![
-        (WARP, Alloc::contract(U256::ZERO, 1, Bytes::from_static(&[0x01]))),
+        (
+            WARP,
+            Alloc::contract(U256::ZERO, 1, Bytes::from_static(&[0x01])),
+        ),
         (
             Address::new(hex_address("9011E888251AB053B7bD1cdB598Db4f9DEd94714")),
             Alloc::funded(u256_hex("193e5939a08ce9dbd480000000")),
@@ -158,10 +190,23 @@ fn lux_alloc() -> Vec<(Address, Alloc)> {
 /// Transcribed from `luxfi/genesis@v1.16.19 configs/mainnet/cchain.json`, which
 /// is the document the Go node is started with. That module also records what
 /// the values are supposed to hash to, in `cchain.canonical.json`, and the
-/// tests here check against those numbers rather than against ours.
+/// tests here check against those numbers rather than against ours. Its
+/// `config` — the fee schedule, the fee split and warp — is the one the node
+/// repo's `genesis/mainnet.json` carries.
 pub fn mainnet() -> Genesis {
     Genesis {
         chain_id: 96369,
+        chain: Chain {
+            split: Some(1_789_430_400),
+            warp: Some(1_730_446_786),
+            ..Chain::lux()
+        },
+        fee: fee::Config {
+            gas_limit: 12_000_000,
+            target_gas: 500_000_000,
+            ..fee::Config::DEFAULT
+        },
+        allow_fee_recipients: false,
         timestamp: 0x672485c2,
         gas_limit: 0xb71b00,
         difficulty: U256::ZERO,
@@ -179,9 +224,14 @@ pub fn mainnet() -> Genesis {
 /// `configs/localnet/cchain.json`. The chain id is the one a local development
 /// network answers `eth_chainId` with, and it is NOT the mainnet id: a node
 /// that compiles either one in is a node that cannot be pointed at the other.
+/// Its `config` names nothing but the chain id, so it runs Go's defaults: every
+/// upgrade from genesis and `DefaultFeeConfig`.
 pub fn localnet() -> Genesis {
     Genesis {
         chain_id: 31337,
+        chain: Chain::lux(),
+        fee: fee::Config::DEFAULT,
+        allow_fee_recipients: false,
         timestamp: 0x6a065656,
         gas_limit: 0xb71b00,
         difficulty: U256::ZERO,
@@ -194,10 +244,13 @@ pub fn localnet() -> Genesis {
     }
 }
 
-/// The Lux testnet C-chain, chain id 96300.
+/// The Lux testnet C-chain, chain id 96300, under Go's default schedule.
 pub fn testnet() -> Genesis {
     Genesis {
         chain_id: 96300,
+        chain: Chain::lux(),
+        fee: fee::Config::DEFAULT,
+        allow_fee_recipients: false,
         timestamp: 0x672485c2,
         gas_limit: 0xb71b00,
         difficulty: U256::ZERO,
@@ -276,7 +329,10 @@ mod tests {
             timestamp: 0,
             base_fee: 25_000_000_000,
             alloc: vec![
-                (WARP, Alloc::contract(U256::ZERO, 1, Bytes::from_static(&[0x01]))),
+                (
+                    WARP,
+                    Alloc::contract(U256::ZERO, 1, Bytes::from_static(&[0x01])),
+                ),
                 (
                     Address::new(hex_address("703D4227d58d0b6A20BD721c940CED170470f634")),
                     Alloc::funded(u256_hex("d3c21bcecceda1000000")),

@@ -12,7 +12,10 @@ names a block the way the network names it.
 - `src/precompile.rs` — which precompile answers where, and at what price.
 - `src/state.rs` — the world the roots are taken over, kept as its tries.
 - `src/trie.rs` — a Merkle-Patricia trie whose nodes never change once made.
-- `src/block.rs` — `run` (the ONE interpreter call), `apply`, `execute`, `call`.
+- `src/fee.rs` — the fee window, base fee, block gas cost, extra and block
+  fee: every header field Go derives from the parent.
+- `src/block.rs` — `run` (the ONE interpreter call), `apply`, `execute`, `call`;
+  `Env::next` (a child's environment, derived) and `rule` (Go's header rule).
 - `src/header.rs` — every header shape Go's `DecodeHeader` reads, and their RLP.
 - `src/genesis.rs` — block zero, as a document.
 - `tests/headers.rs` — 21 real mainnet headers, decoded and re-named, and Go's
@@ -79,10 +82,36 @@ names a block the way the network names it.
   paying and NOTHING else, and is only reachable through `block::call`, which
   takes the world by value so discarding the result is structural.
 
-- **`block_gas_cost` is supplied, not derived.** Go computes it from a fee
-  schedule this crate does not model. Every network here sets that schedule to
-  zero and the mainnet history agrees, so zero is right for them; a network with
-  a real schedule needs the formula first.
+- **A block's header is derived from its parent, never chosen.** `Env::next`
+  is the one way to a child's environment and `block::rule` the one check of a
+  header, both against luxfi/evm v1.104.56 (luxd v1.37.9): gas limit =
+  `feeConfig.gasLimit`; extra = the fee window rolled from the parent's (80
+  bytes), then from Durango `predicate.Results{}.Bytes()` = six zero bytes
+  (86 in all — Go's live VM refuses 80); base fee from the window
+  (`baseFeeFromWindow`, the minimum after the genesis); block gas cost
+  `clamp(parent ± step·|target − elapsed|)`, the minimum after the genesis;
+  coinbase `0x0100…00` unless `allowFeeRecipients`; difficulty 1, nonce 0, mix
+  0, empty uncle root; time ≥ parent and ≤ now + 10 s. `finish` holds the tips
+  to the cost (`verifyBlockFee`) on BOTH the proposer's and verifier's path.
+  Held to Go three ways: Go's `InsertChain`, Go's live VM (the luxd EVM
+  plugin) and cevm all import a 430-block chain this crate built with equal
+  roots, and every block of the four Go corpora passes it.
+
+- **A block's cost lives in its header, or it is zero.** `consensus.go:169-175`
+  reads an absent cost as zero; Go's import path, cevm and this crate agree.
+  What this crate builds carries a non-zero cost ("19 lux"). Go's VM instead
+  pre-fills an absent cost from the parent (`ensureBlockGasCost`), and Go's
+  builder never writes one into the header — so a Go-built block under two
+  seconds after its parent that owes a cost passes Go's live VM and is refused
+  by Go's own import, cevm and here. No block of the corpora is one: all are
+  at least two seconds apart. Go also keeps the cost in a map by header hash,
+  persisted under `bgc`; a parent whose cost it never persisted (genesis,
+  state-synced tip, pre-`bgc` luxd) derives its child from nil after a restart.
+
+- **A warp predicate is refused, not verified.** Once `warpConfig` is on, a
+  transaction whose access list names 0x0200…05 is a predicate Go prices and
+  verifies against the P-chain; `apply` refuses it (`Invalid::Predicate`), so
+  a block's predicate results are always the six zero bytes.
 
 - **chainId is genesis data.** Mainnet 96369, localnet 31337. A node that
   compiles one in replays onto whichever network it was built for.

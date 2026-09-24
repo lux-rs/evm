@@ -38,13 +38,19 @@ use revm::handler::Handler as _;
 use revm::primitives::hardfork::SpecId;
 use revm::{DatabaseCommit as _, MainContext};
 
+use crate::fee;
 use crate::header;
 use crate::root;
-use crate::rules::Chain;
+use crate::rules::{Chain, WARP};
 use crate::state::World;
 use crate::{Handler, Precompiles, Profile};
 
-/// What a block is executed under: the proposer's choices, plus the chain's.
+/// What a block is executed under: the chain's configuration, and the values
+/// its header carries — every one of which Go derives from the parent.
+///
+/// A chain's own is [`Genesis::env`](crate::Genesis::env); [`Env::next`] is the
+/// one way to the environment of a block after it, and [`rule`] holds a block
+/// someone else built to it.
 #[derive(Clone, Debug)]
 pub struct Env {
     /// When each Lux rule turns on.
@@ -57,51 +63,202 @@ pub struct Env {
     pub spec: SpecId,
     /// Which precompiles are admitted.
     pub profile: Profile,
+    /// The fee schedule every header field below is derived under.
+    pub fee: fee::Config,
+    /// `allowFeeRecipients`: a builder may name its own coinbase.
+    pub allow_fee_recipients: bool,
+    /// The coinbase. A builder's is its fee recipient where the chain allows
+    /// one and [`fee::BLACKHOLE`] otherwise — also Go's when none is set.
     pub beneficiary: Address,
     pub timestamp: u64,
     pub gas_limit: u64,
     pub base_fee: u64,
+    /// 1 after the genesis: Go's `Prepare`, and the only value its VM accepts.
     pub difficulty: U256,
+    /// The fee window, then — from Durango — the predicate results.
     pub extra_data: Bytes,
     pub mix_hash: B256,
-    /// The block gas cost the header carries — none when it is zero, which is
-    /// how Go reads the ordinary 17-field shape (see [`crate::header`]).
-    ///
-    /// SUPPLIED, NOT DERIVED. Go computes it from the fee schedule —
-    /// `minBlockGasCost`, `maxBlockGasCost`, `blockGasCostStep` and how long
-    /// the parent took — and that schedule is not modelled here. Every network
-    /// whose genesis this crate carries sets all three to zero, which makes the
-    /// value zero for every block, and the mainnet header history agrees: block
-    /// 1 through 1,082,780 all carry none. A network with a non-zero schedule
-    /// needs the formula before this can be right for it.
-    pub block_gas_cost: U256,
+    /// The block gas cost the block is under, derived from its parent's
+    /// ([`fee::cost`]). The header carries it when it is not zero.
+    pub block_gas_cost: u64,
 }
 
 impl Env {
-    /// The environment a Lux C-chain block is executed under.
-    pub fn lux(chain_id: u64, base_fee: u64, gas_limit: u64) -> Self {
-        Self {
-            chain: Chain::lux(),
-            chain_id,
-            spec: SpecId::SHANGHAI,
-            profile: Profile::default(),
-            beneficiary: Address::ZERO,
-            timestamp: 0,
-            gas_limit,
-            base_fee,
-            difficulty: U256::ZERO,
-            extra_data: Bytes::new(),
-            mix_hash: B256::ZERO,
-            block_gas_cost: U256::ZERO,
+    /// The environment of a block at `time` on top of `parent`.
+    ///
+    /// Every field Go derives, derived: the gas limit (`header.GasLimit`), the
+    /// base fee, the block gas cost and the extra (see [`fee`]). And the ones
+    /// its builder fixes: difficulty 1, a zero mix digest, and the blackhole
+    /// for a coinbase unless the chain lets a builder name its fee recipient
+    /// (miner/worker.go:135-205 `commitNewWork`). Refused before the EVM
+    /// upgrade, whose rules this crate does not run.
+    pub fn next(&self, parent: &header::Lux, time: u64) -> Result<Self, fee::Error> {
+        if !self.chain.at(time).evm {
+            return Err(fee::Error::PreEvm);
         }
+        let head = &parent.header;
+        let window = fee::window(&self.chain, head, time)?;
+        Ok(Self {
+            timestamp: time,
+            gas_limit: self.fee.gas_limit,
+            base_fee: fee::base_fee(&self.chain, &self.fee, head, time)?,
+            block_gas_cost: fee::cost(&self.fee, cost_of(parent), head.timestamp, time),
+            extra_data: fee::extra(&window, self.chain.at(time).durango),
+            difficulty: U256::from(1u64),
+            mix_hash: B256::ZERO,
+            beneficiary: if self.allow_fee_recipients {
+                self.beneficiary
+            } else {
+                fee::BLACKHOLE
+            },
+            ..self.clone()
+        })
     }
 }
 
-/// Why a transaction cannot be in a block.
+/// The block gas cost a child of `parent` derives from: none for the genesis,
+/// and otherwise what the parent's header carries, zero when it carries none.
+fn cost_of(parent: &header::Lux) -> Option<u64> {
+    (parent.header.number > 0).then(|| {
+        parent
+            .block_gas_cost
+            .unwrap_or_default()
+            .saturating_to::<u64>()
+    })
+}
+
+/// How far past a node's clock a block may be dated: `allowedFutureBlockTime`
+/// (consensus/dummy/consensus.go:28) and the VM's `maxFutureBlockTime`
+/// (plugin/evm/vm.go:114).
+pub const FUTURE: u64 = 10;
+
+/// Go's rule for a header: whether `claimed` may follow `parent` by the clock
+/// `now`. Returns the environment the block runs under.
+///
+/// Every clause is one Go applies, cited where it is: the dummy engine's
+/// `verifyHeader` and `verifyHeaderGasFields` (consensus/dummy/consensus.go:
+/// 129-226), the VM's `SyntacticVerify` (plugin/evm/block_verification.go:
+/// 32-170) and `verifyPredicates` (plugin/evm/block.go:429-460), and the body
+/// check's uncle root (core/block_validator.go:65-76). What is left — the
+/// block fee, and the roots and gas that only running the block gives — is
+/// [`finish`]'s, on both the proposer's side and the verifier's.
+///
+/// `now` is `None` for history: a block a node already accepted is not held to
+/// that node's clock a second time, as Go does not re-verify what it wrote.
+pub fn rule(
+    env: &Env,
+    parent: &header::Lux,
+    claimed: &header::Lux,
+    now: Option<u64>,
+) -> Result<Env, Invalid> {
+    let h = &claimed.header;
+    let (head, parent) = (parent, &parent.header);
+    let no = |why: String| Err(Invalid::Header(why));
+    // consensus.go:213-216: the parent's number plus one.
+    if h.number != parent.number + 1 {
+        return no(format!(
+            "number {} on a parent at {}",
+            h.number, parent.number
+        ));
+    }
+    // consensus.go:204-212: not before the parent — equal is several blocks a
+    // second — and not more than `FUTURE` past the clock.
+    if h.timestamp < parent.timestamp {
+        return no(format!(
+            "timestamp {} before its parent's {}",
+            h.timestamp, parent.timestamp
+        ));
+    }
+    if now.is_some_and(|now| h.timestamp > now.saturating_add(FUTURE)) {
+        return no(format!("timestamp {} in the future", h.timestamp));
+    }
+    // block_verification.go:49-62.
+    if h.difficulty != U256::from(1u64) {
+        return no(format!("difficulty {}", h.difficulty));
+    }
+    if h.nonce != B64::ZERO {
+        return no(format!("nonce {}", h.nonce));
+    }
+    if h.mix_hash != B256::ZERO {
+        return no(format!("mix digest {}", h.mix_hash));
+    }
+    // consensus.go:182-186, 250-255 and block_validator.go:72-75: no uncles,
+    // so the uncle root is the empty list's. The list itself is the reader's.
+    if h.ommers_hash != EMPTY_OMMER_ROOT_HASH {
+        return no(format!("uncle hash {}", h.ommers_hash));
+    }
+    // consensus.go:217-224: Lux runs no blobs.
+    if h.blob_gas_used.is_some_and(|g| g != 0) {
+        return no("blob gas used".into());
+    }
+
+    let mut next = env
+        .next(head, h.timestamp)
+        .map_err(|e| Invalid::Header(e.to_string()))?;
+    let durango = env.chain.at(h.timestamp).durango;
+
+    // header/gas_limit.go:68-83 and 46-65: the schedule's limit, exactly, and
+    // no more gas than it.
+    if h.gas_limit != next.gas_limit {
+        return no(format!("gas limit {}, not {}", h.gas_limit, next.gas_limit));
+    }
+    if h.gas_used > next.gas_limit {
+        return no(format!(
+            "gas used {} over the limit {}",
+            h.gas_used, next.gas_limit
+        ));
+    }
+    // header/extra.go:74-106: at least a window from Durango, exactly one
+    // before it.
+    let extra = &h.extra_data;
+    if extra.len() < fee::WINDOW_SIZE || (!durango && extra.len() != fee::WINDOW_SIZE) {
+        return no(format!("{} bytes of extra", extra.len()));
+    }
+    // header/extra.go:47-68: the window derived from the parent.
+    if extra[..fee::WINDOW_SIZE] != next.extra_data[..fee::WINDOW_SIZE] {
+        return no("an extra that does not begin with the fee window".into());
+    }
+    // block.go:429-460: the predicate results the block's transactions give.
+    // For a block this crate can run that is none — a transaction carrying a
+    // predicate is refused in [`apply`] — so the bytes are `NO_PREDICATES`.
+    if extra[fee::WINDOW_SIZE..] != next.extra_data[fee::WINDOW_SIZE..] {
+        return no("predicate results this block's transactions do not give".into());
+    }
+    // consensus.go:149-159: the base fee as derived.
+    if h.base_fee_per_gas != Some(next.base_fee) {
+        return no(format!(
+            "base fee {:?}, not {}",
+            h.base_fee_per_gas, next.base_fee
+        ));
+    }
+    // consensus.go:161-177 and 336-350: the block gas cost as derived, and a
+    // header that carries none owes zero (see [`fee`] on where a cost lives).
+    let cost = claimed.block_gas_cost.unwrap_or_default();
+    if cost != U256::from(next.block_gas_cost) {
+        return no(format!(
+            "block gas cost {cost}, not {}",
+            next.block_gas_cost
+        ));
+    }
+    // consensus.go:106-127 and core/blockchain_reader.go:418-431: any coinbase
+    // where fee recipients are allowed, the blackhole where they are not.
+    if env.allow_fee_recipients {
+        next.beneficiary = h.beneficiary;
+    } else if h.beneficiary != fee::BLACKHOLE {
+        return no(format!(
+            "coinbase {}, not {}",
+            h.beneficiary,
+            fee::BLACKHOLE
+        ));
+    }
+    Ok(next)
+}
+
+/// Why a transaction cannot be in a block, or a block cannot be one.
 ///
 /// A transaction that runs and reverts is NOT here: it consumed gas, it has a
 /// receipt, and it belongs in the block. This is only the transactions that
-/// cannot be executed at all.
+/// cannot be executed at all, and the blocks Go's rule refuses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Invalid {
     /// The signature does not recover to an address.
@@ -112,6 +269,13 @@ pub enum Invalid {
     GasLimit { used: u64, limit: u64 },
     /// revm refused it: wrong nonce, too poor, fee below base.
     Rejected(String),
+    /// Its access list names the warp precompile while warp is on, which makes
+    /// it a predicate Go verifies and prices, and this crate does not.
+    Predicate,
+    /// The header is not the one Go derives from its parent ([`rule`]).
+    Header(String),
+    /// The block's tips do not cover its block gas cost ([`fee::covered`]).
+    Fee(String),
 }
 
 impl core::fmt::Display for Invalid {
@@ -123,6 +287,9 @@ impl core::fmt::Display for Invalid {
                 write!(f, "gas {used} over the block limit {limit}")
             }
             Invalid::Rejected(why) => write!(f, "{why}"),
+            Invalid::Predicate => write!(f, "a warp predicate, which this node does not verify"),
+            Invalid::Header(why) => write!(f, "header: {why}"),
+            Invalid::Fee(why) => write!(f, "{why}"),
         }
     }
 }
@@ -163,6 +330,13 @@ pub fn apply(
                 got: id,
             });
         }
+    }
+    if env.chain.at(env.timestamp).warp
+        && tx
+            .access_list()
+            .is_some_and(|l| l.iter().any(|item| item.address == WARP))
+    {
+        return Err(Invalid::Predicate);
     }
 
     let (result, state) = run(world, env, to_revm(tx, sender), Checks::All)?;
@@ -322,10 +496,11 @@ pub fn execute(
         kept.push(tx);
     }
 
-    Ok(finish(world, parent, env, kept, receipts, cumulative))
+    finish(world, parent, env, kept, receipts, cumulative)
 }
 
-/// Seal what ran into a header.
+/// Seal what ran into a header, once its tips are known to cover the block gas
+/// cost (consensus.go:322-364 `Finalize`, 366-434 `FinalizeAndAssemble`).
 ///
 /// Separate from [`execute`] because a proposer reaches this point by a
 /// different route and must arrive at the same header — one place that decides
@@ -337,7 +512,11 @@ pub fn finish(
     transactions: Vec<TxEnvelope>,
     receipts: Vec<ReceiptEnvelope>,
     gas_used: u64,
-) -> Built {
+) -> Result<Built, Invalid> {
+    if env.chain.at(env.timestamp).evm {
+        fee::covered(env.base_fee, env.block_gas_cost, &transactions, &receipts)
+            .map_err(Invalid::Fee)?;
+    }
     let encoded: Vec<Vec<u8>> = transactions.iter().map(|t| t.encoded_2718()).collect();
     let receipts_encoded: Vec<Vec<u8>> = receipts.iter().map(|r| r.encoded_2718()).collect();
     let logs_bloom = receipts
@@ -365,13 +544,13 @@ pub fn finish(
         // has a position for one.
         ..Default::default()
     };
-    Built {
+    Ok(Built {
         // Every block but the genesis is in a Lux shape. The genesis is built
         // by `genesis::Genesis`, never here.
-        header: header::Lux::block(fields, env.block_gas_cost),
+        header: header::Lux::block(fields, U256::from(env.block_gas_cost)),
         transactions,
         receipts,
-    }
+    })
 }
 
 /// The bloom a receipt carries.
@@ -454,27 +633,41 @@ mod tests {
         )
     }
 
-    /// A funded world, and the environment its blocks run under.
-    fn chain() -> (World, header::Lux, Env, Address) {
-        let who = who();
-        let g = genesis::Genesis {
-            alloc: vec![(who, genesis::Alloc::funded(U256::from(10u64).pow(U256::from(21u64))))],
+    /// Mainnet's configuration, with the test key funded.
+    fn funded() -> genesis::Genesis {
+        genesis::Genesis {
+            alloc: vec![(
+                who(),
+                genesis::Alloc::funded(U256::from(10u64).pow(U256::from(21u64))),
+            )],
             ..genesis::mainnet()
-        };
-        let env = Env {
-            beneficiary: address!("00000000000000000000000000000000000000c0"),
-            ..Env::lux(g.chain_id, g.base_fee, g.gas_limit)
-        };
-        (g.world(), g.sealed(), env, who)
+        }
+    }
+
+    /// A funded world, its genesis, and the environment of block one a minute
+    /// after it — derived, as Go derives it.
+    fn chain() -> (World, header::Lux, Env, Address) {
+        let g = funded();
+        let parent = g.sealed();
+        let env = g
+            .env()
+            .next(&parent, parent.header.timestamp + 60)
+            .expect("derives");
+        (g.world(), parent, env, who())
     }
 
     fn send(nonce: u64, chain_id: u64, value: U256) -> (TxEnvelope, Address) {
+        paying(nonce, chain_id, value, 1_000_000_000)
+    }
+
+    /// A transfer whose tip over the base fee is `tip`.
+    fn paying(nonce: u64, chain_id: u64, value: U256, tip: u128) -> (TxEnvelope, Address) {
         let tx = TxEip1559 {
             chain_id,
             nonce,
             gas_limit: 100_000,
-            max_fee_per_gas: 30_000_000_000,
-            max_priority_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas: 25_000_000_000 + tip,
+            max_priority_fee_per_gas: tip,
             to: TxKind::Call(TO),
             value,
             ..Default::default()
@@ -483,14 +676,22 @@ mod tests {
         (TxEnvelope::Eip1559(tx.into_signed(sig)), who())
     }
 
+    /// The clock the tests verify by: well after every block they build.
+    const NOW: Option<u64> = Some(u64::MAX / 2);
+
     #[test]
     fn a_block_moves_value_and_the_state_root_with_it() {
         let (mut world, parent, env, who) = chain();
         let before = world.root();
         let value = U256::from(1_000u64);
 
-        let built = execute(&mut world, &parent, &env, vec![send(0, env.chain_id, value)])
-            .expect("the block executes");
+        let built = execute(
+            &mut world,
+            &parent,
+            &env,
+            vec![send(0, env.chain_id, value)],
+        )
+        .expect("the block executes");
 
         assert_eq!(built.fields().number, 1);
         assert_eq!(built.fields().parent_hash, parent.seal());
@@ -529,7 +730,8 @@ mod tests {
         assert_eq!(built.fields().transactions_root, root::EMPTY);
         assert_eq!(built.fields().receipts_root, root::EMPTY);
         assert_eq!(
-            built.fields().state_root, parent.header.state_root,
+            built.fields().state_root,
+            parent.header.state_root,
             "nothing ran, so nothing changed"
         );
     }
@@ -571,10 +773,11 @@ mod tests {
             vec![send(0, env.chain_id, U256::from(1u64))],
         )
         .expect("first");
+        let next = env.next(&first.header, env.timestamp + 2).expect("derives");
         let second = execute(
             &mut world,
             &first.header,
-            &env,
+            &next,
             vec![send(1, env.chain_id, U256::from(1u64))],
         )
         .expect("second");
@@ -599,9 +802,283 @@ mod tests {
         // effective price under a 25 gwei base fee and a 1 gwei tip is 26 gwei.
         let paid = world.balance(&env.beneficiary);
         assert_eq!(
+            env.beneficiary,
+            fee::BLACKHOLE,
+            "mainnet names no fee recipient"
+        );
+        assert_eq!(
             paid,
             U256::from(built.fields().gas_used as u128 * 26_000_000_000u128)
         );
+    }
+
+    #[test]
+    fn a_built_block_is_one_the_rule_derives() {
+        let g = funded();
+        let (mut world, parent, env, _) = chain();
+        let built = execute(
+            &mut world,
+            &parent,
+            &env,
+            vec![send(0, env.chain_id, U256::from(1u64))],
+        )
+        .expect("builds");
+        let h = built.fields();
+        assert_eq!(h.extra_data.len(), 86, "the window and no predicates");
+        assert_eq!(
+            &h.extra_data[..80],
+            &[0u8; 80][..],
+            "the first block's window is empty"
+        );
+        assert_eq!(h.beneficiary, fee::BLACKHOLE);
+        assert_eq!(h.difficulty, U256::from(1u64));
+        assert_eq!(h.gas_limit, 12_000_000, "the schedule's limit");
+        assert_eq!(
+            h.base_fee_per_gas,
+            Some(25_000_000_000),
+            "the minimum, after the genesis"
+        );
+        let ruled = rule(&g.env(), &parent, &built.header, NOW).expect("passes");
+        assert_eq!(ruled.base_fee, env.base_fee);
+        assert_eq!(ruled.extra_data, env.extra_data);
+        assert_eq!(ruled.block_gas_cost, 0);
+
+        // The second, in the same second: its window holds the first's gas,
+        // and it owes a block gas cost of two steps.
+        let next = env.next(&built.header, env.timestamp).expect("derives");
+        assert_eq!(next.block_gas_cost, 400_000);
+        let w = fee::Window::parse(&next.extra_data).expect("a window");
+        assert_eq!(w.0[9], 21_000, "the parent's gas, in its second");
+        let second = execute(
+            &mut world,
+            &built.header,
+            &next,
+            vec![paying(1, env.chain_id, U256::from(1u64), 500_000_000_000)],
+        )
+        .expect("the tip covers the cost");
+        assert_eq!(second.header.layout.name, "19 lux", "a cost is carried");
+        assert_eq!(second.header.block_gas_cost, Some(U256::from(400_000u64)));
+        rule(&g.env(), &built.header, &second.header, NOW).expect("passes");
+    }
+
+    #[test]
+    fn a_fast_block_pays_its_block_gas_cost_or_is_not_a_block() {
+        let (mut world, parent, env, _) = chain();
+        let first = execute(
+            &mut world,
+            &parent,
+            &env,
+            vec![send(0, env.chain_id, U256::ZERO)],
+        )
+        .expect("first");
+        let next = env.next(&first.header, env.timestamp).expect("derives");
+        // 400,000 gas at 25 gwei is 1e16 wei of tips; 21,000 gas at 1 gwei is
+        // far short of it.
+        let refused = execute(
+            &mut world.clone(),
+            &first.header,
+            &next,
+            vec![send(1, env.chain_id, U256::ZERO)],
+        );
+        assert!(matches!(refused, Err(Invalid::Fee(_))), "{refused:?}");
+        // 476,190,476,191 wei a gas is the least tip that covers it.
+        let short = paying(1, env.chain_id, U256::ZERO, 476_190_476_190);
+        let enough = paying(1, env.chain_id, U256::ZERO, 476_190_476_191);
+        assert!(matches!(
+            execute(&mut world.clone(), &first.header, &next, vec![short]),
+            Err(Invalid::Fee(_))
+        ));
+        execute(&mut world, &first.header, &next, vec![enough]).expect("exactly covered");
+
+        // Two seconds on, the target rate, and nothing is owed.
+        let slow = env.next(&first.header, env.timestamp + 2).expect("derives");
+        assert_eq!(slow.block_gas_cost, 0);
+    }
+
+    #[test]
+    fn every_derived_field_is_held_to_what_the_parent_gives() {
+        let g = funded();
+        let (mut world, parent, env, _) = chain();
+        let built = execute(
+            &mut world,
+            &parent,
+            &env,
+            vec![send(0, env.chain_id, U256::ZERO)],
+        )
+        .expect("builds");
+        let ok = |h: &header::Lux| rule(&g.env(), &parent, h, NOW);
+        ok(&built.header).expect("the block as built");
+        type Edit = fn(&mut header::Lux);
+        let edits: [(&str, Edit); 15] = [
+            ("number", |h| h.header.number += 1),
+            ("before its parent", |h| h.header.timestamp = 0),
+            ("gas limit", |h| h.header.gas_limit += 1),
+            ("base fee", |h| {
+                h.header.base_fee_per_gas = Some(25_000_000_001)
+            }),
+            ("window", |h| {
+                let mut e = h.header.extra_data.to_vec();
+                e[79] = 1;
+                h.header.extra_data = e.into();
+            }),
+            ("predicate results", |h| {
+                let mut e = h.header.extra_data.to_vec();
+                e[85] = 1;
+                h.header.extra_data = e.into();
+            }),
+            ("no predicate results", |h| {
+                h.header.extra_data = h.header.extra_data.slice(..80)
+            }),
+            ("short extra", |h| {
+                h.header.extra_data = h.header.extra_data.slice(..79)
+            }),
+            ("coinbase", |h| h.header.beneficiary = Address::ZERO),
+            ("difficulty", |h| h.header.difficulty = U256::ZERO),
+            ("nonce", |h| h.header.nonce = B64::from(1u64)),
+            ("mix digest", |h| h.header.mix_hash = B256::repeat_byte(1)),
+            ("uncle hash", |h| h.header.ommers_hash = B256::ZERO),
+            ("block gas cost", |h| {
+                h.layout = header::named("19 lux");
+                h.block_gas_cost = Some(U256::from(1u64));
+                h.ext_data_hash = Some(B256::ZERO);
+                h.ext_data_gas_used = Some(Bytes::new());
+            }),
+            ("blob gas", |h| {
+                h.layout = header::named("20 lux");
+                h.block_gas_cost = Some(U256::ZERO);
+                h.ext_data_gas_used = Some(Bytes::new());
+                h.header.blob_gas_used = Some(1);
+            }),
+        ];
+        for (what, edit) in edits {
+            let mut h = built.header.clone();
+            edit(&mut h);
+            assert!(
+                matches!(ok(&h), Err(Invalid::Header(_))),
+                "{what}: {:?}",
+                ok(&h)
+            );
+        }
+        let future = rule(
+            &g.env(),
+            &parent,
+            &built.header,
+            Some(env.timestamp - FUTURE - 1),
+        );
+        assert!(
+            matches!(future, Err(Invalid::Header(_))),
+            "a block past the clock"
+        );
+        rule(
+            &g.env(),
+            &parent,
+            &built.header,
+            Some(env.timestamp - FUTURE),
+        )
+        .expect("ten seconds ahead is allowed");
+        rule(&g.env(), &parent, &built.header, None).expect("history is not clocked");
+    }
+
+    #[test]
+    fn a_header_that_omits_a_cost_it_owes_is_refused() {
+        // Go's builder never writes the cost into a header, and its VM fills an
+        // absent one from the parent; its import path, cevm and this crate read
+        // an absent cost as zero, so a block that owes one must carry it.
+        let g = funded();
+        let (mut world, parent, env, _) = chain();
+        let first = execute(
+            &mut world,
+            &parent,
+            &env,
+            vec![send(0, env.chain_id, U256::ZERO)],
+        )
+        .expect("first");
+        assert_eq!(cost_of(&first.header), Some(0), "carries none, owes zero");
+        assert_eq!(cost_of(&parent), None, "the genesis holds none");
+        let next = env.next(&first.header, env.timestamp).expect("derives");
+        let second = execute(
+            &mut world,
+            &first.header,
+            &next,
+            vec![paying(1, env.chain_id, U256::ZERO, 500_000_000_000)],
+        )
+        .expect("second");
+        assert_eq!(cost_of(&second.header), Some(400_000));
+        let bare = header::Lux::block(second.fields().clone(), U256::ZERO);
+        assert_eq!(bare.layout.name, "17");
+        let refused = rule(&g.env(), &first.header, &bare, NOW);
+        assert!(matches!(refused, Err(Invalid::Header(_))), "{refused:?}");
+    }
+
+    #[test]
+    fn a_coinbase_is_the_builders_only_where_the_chain_allows_it() {
+        let g = genesis::Genesis {
+            allow_fee_recipients: true,
+            ..funded()
+        };
+        let parent = g.sealed();
+        let mine = address!("00000000000000000000000000000000000000c0");
+        let env = Env {
+            beneficiary: mine,
+            ..g.env()
+        }
+        .next(&parent, parent.header.timestamp + 60)
+        .expect("derives");
+        assert_eq!(env.beneficiary, mine);
+        let mut world = g.world();
+        let built = execute(
+            &mut world,
+            &parent,
+            &env,
+            vec![send(0, env.chain_id, U256::ZERO)],
+        )
+        .expect("builds");
+        let ruled = rule(&g.env(), &parent, &built.header, NOW).expect("any coinbase");
+        assert_eq!(
+            ruled.beneficiary, mine,
+            "the block runs under the one it names"
+        );
+    }
+
+    #[test]
+    fn a_warp_predicate_is_refused_once_warp_is_on() {
+        let (mut world, _parent, env, _) = chain();
+        let tx = TxEip1559 {
+            chain_id: env.chain_id,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 30_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(TO),
+            access_list: alloy_eips::eip2930::AccessList(vec![
+                alloy_eips::eip2930::AccessListItem {
+                    address: WARP,
+                    storage_keys: vec![B256::ZERO],
+                },
+            ]),
+            ..Default::default()
+        };
+        let sig = sign(tx.signature_hash());
+        let tx = TxEnvelope::Eip1559(tx.into_signed(sig));
+        let on = Env {
+            chain: Chain {
+                warp: Some(env.timestamp),
+                ..env.chain
+            },
+            ..env.clone()
+        };
+        assert_eq!(
+            apply(&mut world.clone(), &on, 0, &tx, who()).err(),
+            Some(Invalid::Predicate)
+        );
+        let before = Env {
+            chain: Chain {
+                warp: Some(env.timestamp + 1),
+                ..env.chain
+            },
+            ..env.clone()
+        };
+        apply(&mut world, &before, 0, &tx, who()).expect("an access list, not yet a predicate");
     }
 
     #[test]
@@ -734,17 +1211,32 @@ mod tests {
 
         assert_ne!(
             want,
-            root_of(&one_receipt(TxType::Legacy, true, 21_000, vec![log.clone()])),
+            root_of(&one_receipt(
+                TxType::Legacy,
+                true,
+                21_000,
+                vec![log.clone()]
+            )),
             "the type flag is part of the 2718 envelope the trie commits to"
         );
         assert_ne!(
             want,
-            root_of(&one_receipt(TxType::Eip1559, false, 21_000, vec![log.clone()])),
+            root_of(&one_receipt(
+                TxType::Eip1559,
+                false,
+                21_000,
+                vec![log.clone()]
+            )),
             "success and failure are different receipts"
         );
         assert_ne!(
             want,
-            root_of(&one_receipt(TxType::Eip1559, true, 21_001, vec![log.clone()])),
+            root_of(&one_receipt(
+                TxType::Eip1559,
+                true,
+                21_001,
+                vec![log.clone()]
+            )),
             "cumulative gas is committed to"
         );
         assert_ne!(
@@ -764,7 +1256,11 @@ mod tests {
         };
         assert_ne!(want, root_of(&blanked), "the logs bloom is committed to");
         blanked = base.clone();
-        assert_eq!(want, root_of(&blanked), "and the unchanged receipt still matches");
+        assert_eq!(
+            want,
+            root_of(&blanked),
+            "and the unchanged receipt still matches"
+        );
     }
 
     #[test]
@@ -784,7 +1280,9 @@ mod tests {
         // could serve a block whose bloom answers filters the receipts do not.
         let log = Log::new_unchecked(TO, vec![B256::repeat_byte(0x22)], Bytes::new());
         let r = one_receipt(TxType::Eip1559, true, 21_000, vec![log]);
-        let folded = [r.clone()].iter().fold(Bloom::ZERO, |acc, x| acc | bloom_of(x));
+        let folded = [r.clone()]
+            .iter()
+            .fold(Bloom::ZERO, |acc, x| acc | bloom_of(x));
         assert_eq!(folded, bloom_of(&r));
         assert_ne!(folded, Bloom::ZERO, "a receipt with a log has a bloom");
     }

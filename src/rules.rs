@@ -26,9 +26,25 @@
 //!   charges it under Shanghai. On a chain with Durango live from genesis the
 //!   two agree; on one without, a Rust node overcharges every deployment.
 //!
+//! - **a predicate is verified before the block runs.** Once the warp
+//!   precompile is on (`warpConfig.blockTimestamp`), a transaction whose access
+//!   list names it carries a predicate: Go prices it with the predicate's own
+//!   gas and verifies it against the P-chain's validator set
+//!   (`core/predicate_check.go CheckPredicates`), and writes the results after
+//!   the fee window in the header. Neither is modelled here, so such a
+//!   transaction is refused rather than run under rules it does not have.
+//!
 //! The field names are Go's — `evm` is `IsEVM`, `split` is `IsFeeSplit`,
-//! `durango` is `IsDurango` — so that one rule has one name in both
-//! languages.
+//! `durango` is `IsDurango`, `warp` is the warp precompile's activation — so
+//! that one rule has one name in both languages.
+
+use alloy_primitives::Address;
+
+/// The warp precompile: the address whose access-list entries are predicates
+/// once [`Chain::warp`] is on.
+pub const WARP: Address = Address::new([
+    0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05,
+]);
 
 /// When a chain turns each rule on. `None` is never; `Some(t)` is every block
 /// at or after `t`.
@@ -43,8 +59,13 @@ pub struct Chain {
     /// The fee-split upgrade.
     pub split: Option<u64>,
     /// `NetworkUpgrades.DurangoTimestamp` — among other things, when initcode
-    /// starts being metered.
+    /// starts being metered and when the predicate results follow the fee
+    /// window in a header's extra.
     pub durango: Option<u64>,
+    /// `warpConfig.blockTimestamp` — when the warp precompile becomes active.
+    /// It is the predicater Lux chains turn on; `stakeWeightConfig`, the other
+    /// one Go registers, is on none of them.
+    pub warp: Option<u64>,
 }
 
 impl Chain {
@@ -58,6 +79,7 @@ impl Chain {
             evm: Some(0),
             split: None,
             durango: Some(0),
+            warp: None,
         }
     }
 
@@ -73,6 +95,7 @@ impl Chain {
             evm: None,
             split: None,
             durango: None,
+            warp: None,
         }
     }
 
@@ -82,6 +105,7 @@ impl Chain {
             evm: forked(self.evm, time),
             split: forked(self.split, time),
             durango: forked(self.durango, time),
+            warp: forked(self.warp, time),
         }
     }
 }
@@ -101,8 +125,11 @@ pub struct Rules {
     pub evm: bool,
     /// The beneficiary receives half the fee; the other half is burned.
     pub split: bool,
-    /// Deploying meters its initcode by the word.
+    /// Deploying meters its initcode by the word, and a header's extra carries
+    /// predicate results after its fee window.
     pub durango: bool,
+    /// An access list naming the warp precompile is a predicate.
+    pub warp: bool,
 }
 
 impl Rules {
@@ -200,6 +227,7 @@ mod tests {
             evm: true,
             split: true,
             durango: true,
+            warp: false,
         };
         assert_eq!(r.reward(3, 3, 0), 4, "floor(9/2), not 3*floor(3/2)");
     }

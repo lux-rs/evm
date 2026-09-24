@@ -13,6 +13,8 @@
 //! - [`rules`] — the rules that make Lux not Ethereum, as a value.
 //! - [`handler`] — those rules in the two places revm asks about them.
 //! - [`gas`] — what a transaction owes before it runs.
+//! - [`fee`] — what a block owes, and the header fields Go derives from its
+//!   parent; [`block::rule`] holds a header to them.
 //! - [`precompile`] — which precompile answers where, and at what price.
 //! - [`header`] and [`root`] — how a block is named and what it commits to.
 //! - [`state`] and [`trie`] — the world, kept as the tries its root is over.
@@ -34,6 +36,7 @@
 //! ```
 
 pub mod block;
+pub mod fee;
 pub mod gas;
 pub mod genesis;
 pub mod handler;
