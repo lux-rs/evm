@@ -8,10 +8,13 @@
 //! computes one instead has forked at genesis while its own tests pass. That is
 //! not hypothetical — it is what the Rust node does today.
 //!
-//! The trie itself is `alloy-trie`'s, not a third implementation here. What
-//! this module carries is the mapping from *what the EVM produced* to *what the
-//! header commits to*, which is where the choices are: transactions are keyed
-//! by index over their 2718 encodings, receipts the same, and state is keyed by
+//! A root over a list built once — transactions, receipts — is `alloy-trie`'s,
+//! built from sorted leaves. The world keeps its own state as tries that are
+//! changed in place of being rebuilt ([`crate::trie`]); `state` and `storage`
+//! here are the from-scratch roots those are held to. What this module carries
+//! is the mapping from *what the EVM produced* to *what the header commits
+//! to*, which is where the choices are: transactions are keyed by index over
+//! their 2718 encodings, receipts the same, and state is keyed by
 //! `keccak(address)` over the four-field account.
 
 use alloy_primitives::{Address, B256, U256};

@@ -15,6 +15,7 @@
 //! - [`gas`] — what a transaction owes before it runs.
 //! - [`precompile`] — which precompile answers where, and at what price.
 //! - [`header`] and [`root`] — how a block is named and what it commits to.
+//! - [`state`] and [`trie`] — the world, kept as the tries its root is over.
 //!
 //! revm is a dependency, not a fork. Three implementations of one protocol are
 //! already two more than the protocol needs; a fourth interpreter, maintained
@@ -41,6 +42,7 @@ pub mod precompile;
 pub mod root;
 pub mod rules;
 pub mod state;
+pub mod trie;
 
 pub use block::{Built, Env, Invalid};
 pub use genesis::{Alloc, Genesis};

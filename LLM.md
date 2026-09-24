@@ -10,7 +10,8 @@ names a block the way the network names it.
 - `src/handler.rs` — those rules in the two places revm asks about them.
 - `src/gas.rs` — what a transaction owes before it runs.
 - `src/precompile.rs` — which precompile answers where, and at what price.
-- `src/state.rs` — the world the roots are taken over.
+- `src/state.rs` — the world the roots are taken over, kept as its tries.
+- `src/trie.rs` — a Merkle-Patricia trie whose nodes never change once made.
 - `src/block.rs` — `run` (the ONE interpreter call), `apply`, `execute`, `call`.
 - `src/header.rs` — every header shape Go's `DecodeHeader` reads, and their RLP.
 - `src/genesis.rs` — block zero, as a document.
@@ -19,10 +20,22 @@ names a block the way the network names it.
 
 ## Decisions worth not relitigating
 
-- **A root is a Merkle-Patricia trie, never a digest over a sorted list.**
-  `state::World` holds every account and hashes them through `alloy-trie`. Two
+- **A root is a Merkle-Patricia trie, never a digest over a sorted list.** Two
   rules a naive store gets wrong and that both move the root: a zero slot is an
   ABSENT slot, and an empty account (EIP-161) is an ABSENT account.
+
+- **The world IS its tries, and they are persistent.** `state::World` keeps
+  accounts in a `trie::Trie` keyed by `keccak(address)`, each account's
+  storage in its own keyed by `keccak(slot)`. A change makes new nodes along
+  its path and shares the rest, and a node hashes itself once, the first time
+  it is asked, into a `OnceLock` — it can never go stale because the node can
+  never change. So a copy of the world is a pointer, a root costs the nodes
+  made since the last root, and there is no cache beside the state to
+  invalidate. The random insert/remove differential in `trie.rs` holds every
+  intermediate root to `alloy-trie`'s `HashBuilder` over the same leaves,
+  including keys with long shared prefixes (inline children, extensions,
+  collapses). The price is a `keccak` per first read of an account or slot in
+  a transaction, and iteration is in trie order, not address order.
 
 - **The genesis is checked against Go, not against ourselves.** `luxfi/genesis`
   records mainnet's state root `0x2d1cedac…` and hash `0x3f4fa2a0…`; both come

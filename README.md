@@ -22,6 +22,8 @@ and nothing else:
 | `precompile` | the stock precompiles behind the classical-family gate             |
 | `header`     | how a block is named: every header shape Go reads, and its RLP     |
 | `root`       | what a block commits to: the transaction, receipt and state tries  |
+| `state`      | the world, kept as the tries its root is over                      |
+| `trie`       | a Merkle-Patricia trie whose nodes never change once made          |
 
 The rules, with the Go they come from:
 
