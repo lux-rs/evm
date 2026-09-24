@@ -108,6 +108,10 @@ names a block the way the network names it.
   persisted under `bgc`; a parent whose cost it never persisted (genesis,
   state-synced tip, pre-`bgc` luxd) derives its child from nil after a restart.
 
+- **PREVRANDAO is the header's difficulty.** Go's block context sets Random
+  to `header.Difficulty` from Shanghai on (core/evm.go:82-89), so the opcode
+  answers 1 on every Lux block; revm's default, the mix digest, answers 0.
+
 - **A warp predicate is refused, not verified.** Once `warpConfig` is on, a
   transaction whose access list names 0x0200…05 is a predicate Go prices and
   verifies against the P-chain; `apply` refuses it (`Invalid::Predicate`), so

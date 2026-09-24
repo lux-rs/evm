@@ -426,7 +426,10 @@ pub fn run(
             b.basefee = env.base_fee;
             b.gas_limit = env.gas_limit;
             b.difficulty = env.difficulty;
-            b.prevrandao = Some(env.mix_hash);
+            // Go's block context sets Random to the header's difficulty from
+            // Shanghai on (core/evm.go:82-89), so PREVRANDAO answers 1 on
+            // every Lux block, not the mix digest.
+            b.prevrandao = Some(B256::from(env.difficulty));
         });
     let mut evm = Evm::new(
         ctx,
@@ -1113,6 +1116,40 @@ mod tests {
             alloy_primitives::hex::encode(out.into_output().unwrap_or_default()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
             "SHA-256(\"abc\")"
+        );
+    }
+
+    #[test]
+    fn prevrandao_is_the_headers_difficulty_as_go_reads_it() {
+        // PREVRANDAO; PUSH0 MSTORE; RETURN(0, 32): the word the opcode answers.
+        let code = Bytes::from_static(&[0x44, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]);
+        let (mut world, _parent, env, _) = chain();
+        let at = address!("00000000000000000000000000000000000000aa");
+        world.insert(
+            at,
+            crate::state::Account {
+                code_hash: revm::bytecode::Bytecode::new_raw(code.clone()).hash_slow(),
+                ..Default::default()
+            },
+            Some(revm::bytecode::Bytecode::new_raw(code)),
+        );
+        assert_eq!(env.difficulty, U256::from(1u64));
+        let out = call(
+            world,
+            &env,
+            TxEnv::builder()
+                .caller(who())
+                .kind(TxKind::Call(at))
+                .gas_limit(100_000)
+                .nonce(0)
+                .chain_id(None)
+                .build_fill(),
+        )
+        .expect("runs");
+        assert_eq!(
+            out.into_output().unwrap_or_default(),
+            Bytes::from(B256::from(U256::from(1u64)).to_vec()),
+            "the difficulty, not the zero mix digest"
         );
     }
 

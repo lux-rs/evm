@@ -278,10 +278,7 @@ pub fn cost(config: &Config, parent_cost: Option<u64>, parent_time: u64, time: u
     };
     let elapsed = time.saturating_sub(parent_time);
     let deviation = config.target_block_rate.abs_diff(elapsed);
-    let change = config
-        .block_gas_cost_step
-        .checked_mul(deviation)
-        .unwrap_or(u64::MAX);
+    let change = config.block_gas_cost_step.saturating_mul(deviation);
     let cost = if elapsed > config.target_block_rate {
         parent
             .checked_sub(change)
