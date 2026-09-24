@@ -102,8 +102,8 @@ pub struct Env {
 impl Env {
     /// The environment of a block at `time` on top of `parent`, whose own
     /// block gas cost is `parent_cost` — the one it was derived under, which
-    /// its header need not carry; `None` for the genesis, whose sixteen fields
-    /// have no place for one.
+    /// its header need not carry; zero for the genesis, as Go sets it
+    /// (core/genesis.go:509-514).
     ///
     /// Every field Go derives, derived: the gas limit (`header.GasLimit`), the
     /// base fee, the block gas cost and the extra (see [`fee`]). And the ones
@@ -117,7 +117,7 @@ impl Env {
     pub fn next(
         &self,
         parent: &header::Lux,
-        parent_cost: Option<u64>,
+        parent_cost: u64,
         time: u64,
     ) -> Result<Self, fee::Error> {
         let rules = self.chain.at(time);
@@ -228,7 +228,7 @@ pub const FUTURE: u64 = 10;
 pub fn rule(
     env: &Env,
     parent: &header::Lux,
-    parent_cost: Option<u64>,
+    parent_cost: u64,
     claimed: &header::Lux,
     now: Option<u64>,
 ) -> Result<Env, Invalid> {
@@ -371,6 +371,9 @@ pub enum Invalid {
     Header(String),
     /// The block's tips do not cover its block gas cost ([`fee::covered`]).
     Fee(String),
+    /// It reached an active precompile this crate does not run — found only
+    /// by running it, so a node that drops it has done the work for nothing.
+    Unrun(String),
 }
 
 impl core::fmt::Display for Invalid {
@@ -386,6 +389,7 @@ impl core::fmt::Display for Invalid {
             Invalid::Blob => write!(f, "a blob transaction, which no Lux block carries"),
             Invalid::Header(why) => write!(f, "header: {why}"),
             Invalid::Fee(why) => write!(f, "{why}"),
+            Invalid::Unrun(why) => write!(f, "{why}"),
         }
     }
 }
@@ -512,9 +516,12 @@ pub fn run(
             c.spec = spec;
             c.chain_id = env.chain_id;
             // A simulation is not paying, so the fee gates are not its
-            // question. Every other rule — gas metering, the interpreter, the
-            // precompile set — is untouched.
+            // question, and its gas is the caller's cap rather than the
+            // block's (Go runs a call in a gas pool of its own). Every other
+            // rule — gas metering, the interpreter, the precompile set — is
+            // untouched.
             c.disable_balance_check = relaxed;
+            c.disable_block_gas_limit = relaxed;
             c.disable_base_fee = relaxed;
             c.disable_nonce_check = relaxed;
             c.disable_eip3607 = relaxed;
@@ -547,9 +554,12 @@ pub fn run(
     evm.ctx.set_tx(tx);
 
     let mut handler: Handler<_, EVMError<core::convert::Infallible>, _> = Handler::new(env.chain);
-    let result: ExecutionResult = handler
-        .run(&mut evm)
-        .map_err(|e| Invalid::Rejected(format!("{e:?}")))?;
+    let result: ExecutionResult = handler.run(&mut evm).map_err(|e| match e {
+        // The one error the precompiles raise that ends a transaction:
+        // `Precompiles::run` refusing an address it does not run.
+        EVMError::Custom(why) => Invalid::Unrun(why),
+        e => Invalid::Rejected(format!("{e:?}")),
+    })?;
     let state = evm.ctx.journal_mut().finalize();
     Ok((result, state))
 }
@@ -823,7 +833,7 @@ mod tests {
         let parent = g.sealed();
         let env = g
             .env()
-            .next(&parent, None, parent.header.timestamp + 60)
+            .next(&parent, 0, parent.header.timestamp + 60)
             .expect("derives");
         (g.world(), parent, env, who())
     }
@@ -946,7 +956,7 @@ mod tests {
         )
         .expect("first");
         let next = env
-            .next(&first.header, Some(env.block_gas_cost), env.timestamp + 2)
+            .next(&first.header, env.block_gas_cost, env.timestamp + 2)
             .expect("derives");
         let second = execute(
             &mut world,
@@ -1012,7 +1022,7 @@ mod tests {
             Some(25_000_000_000),
             "the minimum, after the genesis"
         );
-        let ruled = rule(&g.env(), &parent, None, &built.header, NOW).expect("passes");
+        let ruled = rule(&g.env(), &parent, 0, &built.header, NOW).expect("passes");
         assert_eq!(ruled.base_fee, env.base_fee);
         assert_eq!(ruled.extra_data, env.extra_data);
         assert_eq!(ruled.block_gas_cost, 0);
@@ -1020,7 +1030,7 @@ mod tests {
         // The second, in the same second: its window holds the first's gas,
         // and it owes a block gas cost of two steps.
         let next = env
-            .next(&built.header, Some(env.block_gas_cost), env.timestamp)
+            .next(&built.header, env.block_gas_cost, env.timestamp)
             .expect("derives");
         assert_eq!(next.block_gas_cost, 400_000);
         let w = fee::Window::parse(&next.extra_data).expect("a window");
@@ -1037,7 +1047,7 @@ mod tests {
             "a cost is carried, after Cancun"
         );
         assert_eq!(second.header.block_gas_cost, Some(U256::from(400_000u64)));
-        rule(&g.env(), &built.header, Some(0), &second.header, NOW).expect("passes");
+        rule(&g.env(), &built.header, 0, &second.header, NOW).expect("passes");
     }
 
     #[test]
@@ -1051,7 +1061,7 @@ mod tests {
         )
         .expect("first");
         let next = env
-            .next(&first.header, Some(env.block_gas_cost), env.timestamp)
+            .next(&first.header, env.block_gas_cost, env.timestamp)
             .expect("derives");
         // 400,000 gas at 25 gwei is 1e16 wei of tips; 21,000 gas at 1 gwei is
         // far short of it.
@@ -1073,7 +1083,7 @@ mod tests {
 
         // Two seconds on, the target rate, and nothing is owed.
         let slow = env
-            .next(&first.header, Some(env.block_gas_cost), env.timestamp + 2)
+            .next(&first.header, env.block_gas_cost, env.timestamp + 2)
             .expect("derives");
         assert_eq!(slow.block_gas_cost, 0);
     }
@@ -1089,7 +1099,7 @@ mod tests {
             vec![send(0, env.chain_id, U256::ZERO)],
         )
         .expect("builds");
-        let ok = |h: &header::Lux| rule(&g.env(), &parent, None, h, NOW);
+        let ok = |h: &header::Lux| rule(&g.env(), &parent, 0, h, NOW);
         ok(&built.header).expect("the block as built");
         type Edit = fn(&mut header::Lux);
         let edits: [(&str, Edit); 15] = [
@@ -1145,7 +1155,7 @@ mod tests {
         let future = rule(
             &g.env(),
             &parent,
-            None,
+            0,
             &built.header,
             Some(env.timestamp - FUTURE - 1),
         );
@@ -1156,12 +1166,12 @@ mod tests {
         rule(
             &g.env(),
             &parent,
-            None,
+            0,
             &built.header,
             Some(env.timestamp - FUTURE),
         )
         .expect("ten seconds ahead is allowed");
-        rule(&g.env(), &parent, None, &built.header, None).expect("history is not clocked");
+        rule(&g.env(), &parent, 0, &built.header, None).expect("history is not clocked");
     }
 
     #[test]
@@ -1179,9 +1189,7 @@ mod tests {
             vec![send(0, env.chain_id, U256::ZERO)],
         )
         .expect("first");
-        let next = env
-            .next(&first.header, Some(0), env.timestamp)
-            .expect("derives");
+        let next = env.next(&first.header, 0, env.timestamp).expect("derives");
         let second = execute(
             &mut world,
             &first.header,
@@ -1192,14 +1200,14 @@ mod tests {
         assert_eq!(second.header.block_gas_cost, Some(U256::from(400_000u64)));
         let bare = header::Lux::block(second.fields().clone(), U256::ZERO);
         assert_eq!(bare.layout.name, "20 eth");
-        let ruled = rule(&g.env(), &first.header, Some(0), &bare, NOW).expect("passes");
+        let ruled = rule(&g.env(), &first.header, 0, &bare, NOW).expect("passes");
         assert_eq!(
             ruled.block_gas_cost, 400_000,
             "and it is under the derived cost"
         );
         // Its child derives from that cost, not from the absent field.
         let child = ruled
-            .next(&bare, Some(ruled.block_gas_cost), ruled.timestamp)
+            .next(&bare, ruled.block_gas_cost, ruled.timestamp)
             .expect("derives");
         assert_eq!(child.block_gas_cost, 800_000);
     }
@@ -1216,7 +1224,7 @@ mod tests {
             beneficiary: mine,
             ..g.env()
         }
-        .next(&parent, None, parent.header.timestamp + 60)
+        .next(&parent, 0, parent.header.timestamp + 60)
         .expect("derives");
         assert_eq!(env.beneficiary, mine);
         let mut world = g.world();
@@ -1227,7 +1235,7 @@ mod tests {
             vec![send(0, env.chain_id, U256::ZERO)],
         )
         .expect("builds");
-        let ruled = rule(&g.env(), &parent, None, &built.header, NOW).expect("any coinbase");
+        let ruled = rule(&g.env(), &parent, 0, &built.header, NOW).expect("any coinbase");
         assert_eq!(
             ruled.beneficiary, mine,
             "the block runs under the one it names"
@@ -1299,7 +1307,7 @@ mod tests {
         let tx = calling(0, &env, dex, Bytes::new());
         let refused = apply(&mut world.clone(), &at(env.timestamp), 0, &tx, who());
         assert!(
-            matches!(&refused, Err(Invalid::Rejected(why)) if why.contains("does not run")),
+            matches!(&refused, Err(Invalid::Unrun(why)) if why.contains("does not run")),
             "{refused:?}"
         );
         apply(&mut world, &at(env.timestamp + 1), 0, &tx, who()).expect("not yet active");
@@ -1361,7 +1369,7 @@ mod tests {
             ..funded()
         };
         let parent = g.sealed();
-        let shanghai = g.env().next(&parent, None, late - 1).expect("derives");
+        let shanghai = g.env().next(&parent, 0, late - 1).expect("derives");
         assert_eq!(g.chain.spec(late - 1), SpecId::SHANGHAI);
         let mut world = g.world();
         let built = execute(
@@ -1376,7 +1384,7 @@ mod tests {
         assert_eq!(built.fields().excess_blob_gas, None);
         let cancun = g
             .env()
-            .next(&built.header, Some(shanghai.block_gas_cost), late)
+            .next(&built.header, shanghai.block_gas_cost, late)
             .expect("derives");
         assert_eq!(g.chain.spec(late), SpecId::CANCUN);
         let tip = 500_000_000_000;
@@ -1394,7 +1402,7 @@ mod tests {
         rule(
             &g.env(),
             &built.header,
-            Some(shanghai.block_gas_cost),
+            shanghai.block_gas_cost,
             &next.header,
             NOW,
         )
@@ -1870,7 +1878,7 @@ mod tests {
                 &on,
                 vec![(calling(0, &on, PROBE, Bytes::new()), who())],
             );
-            assert!(block.is_err(), "{name}");
+            assert!(matches!(block, Err(Invalid::Unrun(_))), "{name}: {block:?}");
         }
         let mut w = world.clone();
         let plain = execute(
@@ -1924,7 +1932,7 @@ mod tests {
         let mut world = g.world();
         let env = g
             .env()
-            .next(&parent, None, parent.header.timestamp + 60)
+            .next(&parent, 0, parent.header.timestamp + 60)
             .expect("derives");
         let first = execute(
             &mut world,
@@ -1934,7 +1942,7 @@ mod tests {
         )
         .expect("first");
         let next = env
-            .next(&first.header, Some(env.block_gas_cost), env.timestamp)
+            .next(&first.header, env.block_gas_cost, env.timestamp)
             .expect("derives");
         let second = execute(
             &mut world,
@@ -1949,14 +1957,7 @@ mod tests {
             (read.layout.name, read.seal()),
             ("23", second.header.seal())
         );
-        let ruled = rule(
-            &g.env(),
-            &first.header,
-            Some(env.block_gas_cost),
-            &read,
-            NOW,
-        )
-        .expect("passes");
+        let ruled = rule(&g.env(), &first.header, env.block_gas_cost, &read, NOW).expect("passes");
         assert_eq!(ruled.block_gas_cost, 400_000);
     }
 
@@ -1976,7 +1977,7 @@ mod tests {
         install(&mut world, PROBE, code);
         let mut seals = vec![parent.seal()];
         let mut env = g.env();
-        let mut cost = None;
+        let mut cost = 0;
         for n in 1..=300u64 {
             env = env
                 .next(&parent, cost, parent.header.timestamp + 60)
@@ -2004,8 +2005,39 @@ mod tests {
             }
             let built = execute(&mut world, &parent, &env, vec![]).expect("an empty block");
             seals.push(built.header.seal());
-            cost = Some(env.block_gas_cost);
+            cost = env.block_gas_cost;
             parent = built.header;
         }
+    }
+
+    fn storage_only() -> crate::state::Account {
+        let mut a = crate::state::Account::default();
+        a.storage.set(&U256::from(1u64), U256::from(7u64));
+        a
+    }
+
+    #[test]
+    fn a_storage_only_beacon_account_is_touched_away() {
+        // Go: Exist, then Transfer(0) touches an empty account (nonce 0,
+        // balance 0, no code; storage is not considered), and Finalise(true)
+        // deletes it, storage and all.
+        let (mut world, parent, env, _) = chain();
+        world.insert(BEACON_ROOTS, storage_only(), None);
+        begin(&mut world, &env, &parent).expect("begins");
+        assert!(world.get(&BEACON_ROOTS).is_none(), "kept");
+    }
+
+    #[test]
+    fn a_storage_only_account_called_is_touched_away() {
+        let (mut world, parent, env, _) = chain();
+        world.insert(TO, storage_only(), None);
+        execute(
+            &mut world,
+            &parent,
+            &env,
+            vec![send(0, env.chain_id, U256::ZERO)],
+        )
+        .expect("runs");
+        assert!(world.get(&TO).is_none(), "kept");
     }
 }

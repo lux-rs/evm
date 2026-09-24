@@ -19,6 +19,7 @@ revm = { version = "36", features = [
     "optional_balance_check",
     "optional_no_base_fee",
     "optional_eip3607",
+    "optional_block_gas_limit",
 ] }
 
 # The encodings the network is defined over. A header is keccak of its RLP and
