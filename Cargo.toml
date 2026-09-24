@@ -1,6 +1,6 @@
 [package]
 name = "lux-evm"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "The Lux EVM in Rust. revm as the machine; the Lux rules as values on top of it."
 license = "BSD-3-Clause"
