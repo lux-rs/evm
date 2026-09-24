@@ -247,25 +247,38 @@ impl Lux {
         }
     }
 
-    /// A block this chain builds: "17" — `[baseFee, ""]`, the shape of every
-    /// block on record — or, when it owes a block gas cost, which "17" has no
-    /// position for, "19 lux", the shape Go's `EncodeRLP19Lux` writes.
+    /// A block this chain builds, in the shape luxfi/geth `Header.EncodeRLP`
+    /// writes for its fields (core/types/block.go:370-395):
+    ///
+    /// - before Shanghai, "17" — `[baseFee, ""]`, the shape of every block on
+    ///   record — or, owing a block gas cost, "19 lux" (`EncodeRLP19Lux`);
+    /// - Shanghai, a withdrawals root: Ethereum's 17 fields, "17,
+    ///   withdrawals", in a block that carries its (empty) withdrawals;
+    /// - Cancun, the blob and beacon-root fields too: Ethereum's "20 eth";
+    /// - after Shanghai and owing a cost, Go's generated encoder
+    ///   (gen_header_rlp.go): "23", every Lux field then every Ethereum one,
+    ///   an absent one written as the empty string.
     pub fn block(header: Header, cost: U256) -> Self {
-        if cost.is_zero() {
-            return Self {
-                header,
-                layout: named("17"),
-                block_gas_cost: None,
-                ext_data_hash: None,
-                ext_data_gas_used: None,
-            };
-        }
+        let shanghai = header.withdrawals_root.is_some();
+        let cancun = header.parent_beacon_block_root.is_some();
+        let name = match (cost.is_zero(), shanghai, cancun) {
+            (true, false, _) => "17",
+            (false, false, _) => "19 lux",
+            (true, true, false) => "17, withdrawals",
+            (true, true, true) => "20 eth",
+            (false, true, _) => "23",
+        };
+        let (block_gas_cost, ext_data_hash, ext_data_gas_used) = match name {
+            "19 lux" => (Some(cost), Some(B256::ZERO), Some(Bytes::new())),
+            "23" => (Some(cost), None, Some(Bytes::new())),
+            _ => (None, None, None),
+        };
         Self {
             header,
-            layout: named("19 lux"),
-            block_gas_cost: Some(cost),
-            ext_data_hash: Some(B256::ZERO),
-            ext_data_gas_used: Some(Bytes::new()),
+            layout: named(name),
+            block_gas_cost,
+            ext_data_hash,
+            ext_data_gas_used,
         }
     }
 
@@ -666,6 +679,35 @@ mod tests {
         }
         assert_eq!(Lux::block(london(), U256::ZERO).fields(), 17);
         assert_eq!(Lux::block(london(), U256::from(1u64)).fields(), 19);
+    }
+
+    #[test]
+    fn a_post_shanghai_block_is_in_the_shape_go_encodes() {
+        let mut cancun = london();
+        cancun.withdrawals_root = Some(crate::root::EMPTY);
+        cancun.blob_gas_used = Some(0);
+        cancun.excess_blob_gas = Some(0);
+        cancun.parent_beacon_block_root = Some(B256::ZERO);
+        let plain = Lux::block(cancun.clone(), U256::ZERO);
+        assert_eq!(plain.layout.name, "20 eth");
+        assert_eq!(
+            plain.encoded(),
+            alloy_rlp::encode(&cancun),
+            "Ethereum's own encoding"
+        );
+        let owing = Lux::block(cancun.clone(), U256::from(200_000u64));
+        assert_eq!(owing.layout.name, "23");
+        assert_eq!(Lux::read(&owing.encoded()).expect("reads"), owing);
+
+        let mut shanghai = london();
+        shanghai.withdrawals_root = Some(crate::root::EMPTY);
+        assert_eq!(
+            Lux::block(shanghai.clone(), U256::ZERO).layout.name,
+            "17, withdrawals"
+        );
+        let owing = Lux::block(shanghai, U256::from(1u64));
+        assert_eq!(owing.layout.name, "23");
+        assert_eq!(owing.fields(), 23);
     }
 
     #[test]

@@ -26,22 +26,21 @@
 //!   charges it under Shanghai. On a chain with Durango live from genesis the
 //!   two agree; on one without, a Rust node overcharges every deployment.
 //!
-//! - **a predicate is verified before the block runs.** Once the warp
-//!   precompile is on (`warpConfig.blockTimestamp`), a transaction whose access
-//!   list names it carries a predicate: Go prices it with the predicate's own
-//!   gas and verifies it against the P-chain's validator set
-//!   (`core/predicate_check.go CheckPredicates`), and writes the results after
-//!   the fee window in the header. Neither is modelled here, so such a
-//!   transaction is refused rather than run under rules it does not have.
+//! - **the Ethereum fork is a Lux upgrade.** `params.SetEthUpgrades`
+//!   (luxfi/evm params/config_extra.go:96-150) sets Shanghai to Durango and
+//!   Cancun to Quasar wherever those are scheduled; otherwise the document's
+//!   `shanghaiTime`/`cancunTime` stand, and `parseGenesis` sets both to 0 when
+//!   the document names neither. [`Chain::spec`] turns that into revm's fork.
 //!
 //! The field names are Go's — `evm` is `IsEVM`, `split` is `IsFeeSplit`,
-//! `durango` is `IsDurango`, `warp` is the warp precompile's activation — so
-//! that one rule has one name in both languages.
+//! `durango` is `IsDurango`, `shanghai` and `cancun` are the geth config's
+//! times — so that one rule has one name in both languages.
 
 use alloy_primitives::Address;
+use revm::primitives::hardfork::SpecId;
 
 /// The warp precompile: the address whose access-list entries are predicates
-/// once [`Chain::warp`] is on.
+/// once it is active.
 pub const WARP: Address = Address::new([
     0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05,
 ]);
@@ -62,10 +61,12 @@ pub struct Chain {
     /// starts being metered and when the predicate results follow the fee
     /// window in a header's extra.
     pub durango: Option<u64>,
-    /// `warpConfig.blockTimestamp` — when the warp precompile becomes active.
-    /// It is the predicater Lux chains turn on; `stakeWeightConfig`, the other
-    /// one Go registers, is on none of them.
-    pub warp: Option<u64>,
+    /// `ShanghaiTime`: PUSH0, initcode limits, and a withdrawals root in
+    /// every header after the genesis.
+    pub shanghai: Option<u64>,
+    /// `CancunTime`: transient storage, MCOPY, EIP-6780 SELFDESTRUCT, the blob
+    /// opcodes, and the blob and beacon-root header fields.
+    pub cancun: Option<u64>,
 }
 
 impl Chain {
@@ -79,7 +80,8 @@ impl Chain {
             evm: Some(0),
             split: None,
             durango: Some(0),
-            warp: None,
+            shanghai: Some(0),
+            cancun: Some(0),
         }
     }
 
@@ -95,7 +97,8 @@ impl Chain {
             evm: None,
             split: None,
             durango: None,
-            warp: None,
+            shanghai: None,
+            cancun: None,
         }
     }
 
@@ -105,7 +108,23 @@ impl Chain {
             evm: forked(self.evm, time),
             split: forked(self.split, time),
             durango: forked(self.durango, time),
-            warp: forked(self.warp, time),
+            shanghai: forked(self.shanghai, time),
+            cancun: forked(self.cancun, time),
+        }
+    }
+
+    /// The Ethereum fork a block at `time` runs: `ChainConfig.Rules` with
+    /// `IsMergeTODO` (luxfi/evm params/config_extra.go:27), so before Shanghai
+    /// a Lux block is Paris. Every block number fork is at 0 on a chain this
+    /// crate runs, and Prague is never scheduled on one (the node refuses it).
+    pub const fn spec(&self, time: u64) -> SpecId {
+        let r = self.at(time);
+        if r.cancun {
+            SpecId::CANCUN
+        } else if r.shanghai {
+            SpecId::SHANGHAI
+        } else {
+            SpecId::MERGE
         }
     }
 }
@@ -128,8 +147,10 @@ pub struct Rules {
     /// Deploying meters its initcode by the word, and a header's extra carries
     /// predicate results after its fee window.
     pub durango: bool,
-    /// An access list naming the warp precompile is a predicate.
-    pub warp: bool,
+    /// Ethereum's Shanghai.
+    pub shanghai: bool,
+    /// Ethereum's Cancun.
+    pub cancun: bool,
 }
 
 impl Rules {
@@ -227,7 +248,7 @@ mod tests {
             evm: true,
             split: true,
             durango: true,
-            warp: false,
+            ..Rules::default()
         };
         assert_eq!(r.reward(3, 3, 0), 4, "floor(9/2), not 3*floor(3/2)");
     }

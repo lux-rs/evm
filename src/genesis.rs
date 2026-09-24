@@ -26,6 +26,7 @@ use revm::primitives::{StorageKey, StorageValue};
 use crate::block::Env;
 use crate::fee;
 use crate::header;
+use crate::precompile::{self, Activation, ALWAYS_ON};
 use crate::root;
 use crate::rules::{Chain, WARP};
 use crate::state::{Account, World};
@@ -63,15 +64,20 @@ impl Alloc {
 /// The document a chain starts from.
 ///
 /// The field names are the genesis JSON's, so a reader holding the file can
-/// check them off one at a time. `chain`, `fee` and `allow_fee_recipients` are
-/// its `config`: when each Lux upgrade turns on, `feeConfig`, and
+/// check them off one at a time. `chain`, `fee`, `blob`, `activations` and
+/// `allow_fee_recipients` are its `config`: when each upgrade turns on,
+/// `feeConfig`, `blobSchedule`, the stateful precompiles it turns on, and
 /// `allowFeeRecipients`. Every block after the genesis is derived from them.
+/// `post_merge` is the negation of `skipPostMergeFields`.
 #[derive(Clone, Debug)]
 pub struct Genesis {
     pub chain_id: u64,
     pub chain: Chain,
     pub fee: fee::Config,
+    pub blob: fee::Blob,
+    pub activations: Vec<Activation>,
     pub allow_fee_recipients: bool,
+    pub post_merge: bool,
     pub timestamp: u64,
     pub gas_limit: u64,
     pub difficulty: U256,
@@ -84,9 +90,17 @@ pub struct Genesis {
 }
 
 impl Genesis {
-    /// The world the allocation describes.
+    /// The state block zero commits to: the activation marker of every
+    /// precompile turned on by the genesis time, then the allocation over it —
+    /// Go's order (core/genesis.go:411-427), so an allocated account is the
+    /// allocation's whatever an activation wrote there.
     pub fn world(&self) -> World {
         let mut w = World::new();
+        for a in &self.activations {
+            if a.crossed(None, self.timestamp) {
+                precompile::mark(&mut w, a.address);
+            }
+        }
         for (who, entry) in &self.alloc {
             let code = Bytecode::new_raw(entry.code.clone());
             let code_hash = if entry.code.is_empty() {
@@ -108,9 +122,13 @@ impl Genesis {
     /// Block zero's header.
     ///
     /// Every field is the document's except `stateRoot`, which is the
-    /// allocation's root — the one thing here that is computed rather than
-    /// copied, and therefore the one thing that can disagree with Go.
+    /// genesis state's root — the one thing here that is computed rather than
+    /// copied, and therefore the one thing that can disagree with Go. Unless
+    /// `skipPostMergeFields`, a chain in Cancun at its genesis carries an empty
+    /// withdrawals root, zero blob fields and a zero parent beacon root
+    /// (core/genesis.go:468-503); Shanghai alone adds nothing to block zero.
     pub fn header(&self) -> Header {
+        let cancun = self.post_merge && self.chain.at(self.timestamp).cancun;
         Header {
             parent_hash: B256::ZERO,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
@@ -128,13 +146,15 @@ impl Genesis {
             mix_hash: self.mix_hash,
             nonce: B64::from(self.nonce),
             base_fee_per_gas: Some(self.base_fee),
-            // `skipPostMergeFields` in the C-chain genesis: London's sixteen
-            // fields and nothing after them, whatever later forks are active.
+            withdrawals_root: cancun.then_some(root::EMPTY),
+            blob_gas_used: cancun.then_some(0),
+            excess_blob_gas: cancun.then_some(0),
+            parent_beacon_block_root: cancun.then_some(B256::ZERO),
             ..Default::default()
         }
     }
 
-    /// Block zero, in the sixteen-field shape only the genesis has.
+    /// Block zero, in the shape Go names it by.
     pub fn sealed(&self) -> header::Lux {
         header::Lux::genesis(self.header())
     }
@@ -147,14 +167,17 @@ impl Genesis {
     /// The environment this chain's blocks run under. Its per-block fields are
     /// the first block's; [`Env::next`] derives every block's from its parent.
     pub fn env(&self) -> Env {
+        let head = self.header();
         Env {
             chain: self.chain,
             chain_id: self.chain_id,
-            spec: revm::primitives::hardfork::SpecId::SHANGHAI,
             profile: Profile::default(),
             fee: self.fee,
+            blob: self.blob,
+            activations: self.activations.clone(),
             allow_fee_recipients: self.allow_fee_recipients,
             beneficiary: fee::BLACKHOLE,
+            number: 0,
             timestamp: self.timestamp,
             gas_limit: self.fee.gas_limit,
             base_fee: self.fee.min_base_fee,
@@ -165,6 +188,10 @@ impl Genesis {
             ),
             mix_hash: B256::ZERO,
             block_gas_cost: self.fee.min_block_gas_cost,
+            withdrawals_root: head.withdrawals_root,
+            blob_gas_used: head.blob_gas_used,
+            excess_blob_gas: head.excess_blob_gas,
+            parent_beacon_root: head.parent_beacon_block_root,
         }
     }
 }
@@ -198,7 +225,6 @@ pub fn mainnet() -> Genesis {
         chain_id: 96369,
         chain: Chain {
             split: Some(1_789_430_400),
-            warp: Some(1_730_446_786),
             ..Chain::lux()
         },
         fee: fee::Config {
@@ -206,7 +232,16 @@ pub fn mainnet() -> Genesis {
             target_gas: 500_000_000,
             ..fee::Config::DEFAULT
         },
+        blob: fee::Blob::CANCUN,
+        activations: vec![
+            Activation {
+                address: WARP,
+                at: 1_730_446_786,
+            },
+            ALWAYS_ON[0],
+        ],
         allow_fee_recipients: false,
+        post_merge: false,
         timestamp: 0x672485c2,
         gas_limit: 0xb71b00,
         difficulty: U256::ZERO,
@@ -231,7 +266,10 @@ pub fn localnet() -> Genesis {
         chain_id: 31337,
         chain: Chain::lux(),
         fee: fee::Config::DEFAULT,
+        blob: fee::Blob::CANCUN,
+        activations: ALWAYS_ON.to_vec(),
         allow_fee_recipients: false,
+        post_merge: true,
         timestamp: 0x6a065656,
         gas_limit: 0xb71b00,
         difficulty: U256::ZERO,
@@ -250,7 +288,10 @@ pub fn testnet() -> Genesis {
         chain_id: 96300,
         chain: Chain::lux(),
         fee: fee::Config::DEFAULT,
+        blob: fee::Blob::CANCUN,
+        activations: ALWAYS_ON.to_vec(),
         allow_fee_recipients: false,
+        post_merge: true,
         timestamp: 0x672485c2,
         gas_limit: 0xb71b00,
         difficulty: U256::ZERO,
@@ -306,13 +347,26 @@ mod tests {
     }
 
     #[test]
-    fn localnet_is_the_same_state_at_a_different_chain_id() {
-        // The allocation is shared, so the state root is the same number; the
-        // header is not, because the timestamp and base fee differ. This is
-        // the check that says chain id lives in the config and not in the
-        // state.
-        assert_eq!(localnet().world().root(), MAINNET_STATE_ROOT);
+    fn localnet_is_mainnets_allocation_and_the_system_precompile() {
+        // The allocation is shared; localnet's genesis is after the DEX
+        // settlement precompile's time, so its state also carries that
+        // marker — and is the root a live luxd reports for its localnet.
+        // Chain id lives in the config and not in the state.
+        let bare = Genesis {
+            activations: Vec::new(),
+            ..localnet()
+        };
+        assert_eq!(bare.world().root(), MAINNET_STATE_ROOT);
+        assert_eq!(
+            localnet().world().root(),
+            b256!("497bcca8f4cee479610af8f1ddfa4e38036f5e9447366c2d0277ff70fcf3bdb9")
+        );
         assert_ne!(localnet().hash(), MAINNET_HASH);
+        assert_eq!(
+            localnet().sealed().fields(),
+            20,
+            "Cancun at a post-merge genesis"
+        );
         assert_eq!(localnet().chain_id, 31337, "0x7a69");
         assert_eq!(mainnet().chain_id, 96369);
     }

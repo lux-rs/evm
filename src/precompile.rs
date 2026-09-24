@@ -38,10 +38,22 @@
 //!    address does not change which family it belongs to. revm carries the same
 //!    identity as [`PrecompileId`], so this maps that, not the address.
 //!
+//! ACTIVATION. A stateful precompile a chain turns on — by a genesis config
+//! key, or as a protocol system precompile at a fixed time — is an
+//! [`Activation`]. The block whose transition crosses its time writes the
+//! marker Go writes (`ApplyPrecompileActivations`, luxfi/evm
+//! core/state_processor_ext.go:29-119: nonce 1 and one code byte), at the
+//! genesis when the time is not after it. From then on Go answers calls there
+//! with the precompile; this crate answers the BLS12-381 [`MODULES`] and
+//! REFUSES every other one: a transaction that reaches it cannot be in a
+//! block here, where running the marker byte as code would answer something
+//! Go does not.
+//!
 //! `identity` (0x04) and `modexp` (0x05) are deliberately ungated: Go's
 //! `opForPrecompile` has no case for them, so they fall to [`Op::Unknown`],
 //! which every profile admits. A [`Module`] falls there too — see [`Op::of`].
 
+use revm::bytecode::Bytecode;
 use revm::context::{Cfg, ContextTr, JournalTr, LocalContextTr};
 use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
@@ -53,7 +65,9 @@ use revm::precompile::bls12_381_const::{
 };
 use revm::precompile::bls12_381_utils::msm_required_gas;
 use revm::precompile::{PrecompileError, PrecompileId};
-use revm::primitives::{hardfork::SpecId, Address, Bytes};
+use revm::primitives::{address, hardfork::SpecId, Address, Bytes, U256};
+
+use crate::state::{Account, World};
 
 // revm's EIP-2537 operations, which sit at the addresses the final assignment
 // gives them. The modules below reuse this arithmetic and re-key and re-price
@@ -64,6 +78,50 @@ use revm::precompile::bls12_381::g1_msm::g1_msm as eth_g1_msm;
 use revm::precompile::bls12_381::g2_add::g2_add as eth_g2_add;
 use revm::precompile::bls12_381::g2_msm::g2_msm as eth_g2_msm;
 use revm::precompile::bls12_381::pairing::pairing as eth_pairing;
+
+/// A stateful precompile a chain turns on, and the time it turns on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Activation {
+    pub address: Address,
+    pub at: u64,
+}
+
+impl Activation {
+    /// Whether the transition from `parent` (none for the genesis) to `time`
+    /// crosses it: `IsForkTransition` and `applyAlwaysOnActivations`.
+    pub const fn crossed(&self, parent: Option<u64>, time: u64) -> bool {
+        match parent {
+            None => self.at <= time,
+            Some(p) => p < self.at && self.at <= time,
+        }
+    }
+}
+
+/// The protocol's system precompiles, which no config names: the DEX
+/// settlement precompile, `AlwaysOn` in luxfi/precompile v0.19.22
+/// (dex/settle_module.go:116) and turned on at `DexSettleActivationTime`
+/// (luxfi/evm precompile/registry/bridge.go:53).
+pub const ALWAYS_ON: [Activation; 1] = [Activation {
+    address: address!("0x0000000000000000000000000000000000009999"),
+    at: 1_766_704_800,
+}];
+
+/// The one code byte an activated precompile's account carries.
+pub const MARKER: [u8; 1] = [0x01];
+
+/// Write the activation marker on `who`: `SetNonce(1)` and `SetCode({0x01})`,
+/// keeping its balance and storage, which neither touches.
+pub fn mark(world: &mut World, who: Address) {
+    let code = Bytecode::new_raw(Bytes::from_static(&MARKER));
+    let held = world.get(&who);
+    let account = Account {
+        nonce: 1,
+        balance: held.map_or(U256::ZERO, |a| a.balance),
+        code_hash: code.hash_slow(),
+        storage: held.map(|a| a.storage.clone()).unwrap_or_default(),
+    };
+    world.insert(who, account, Some(code));
+}
 
 /// The precompile families a profile can refuse, mirroring `luxfi/pq`'s `Op`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,6 +496,9 @@ pub struct Precompiles {
     inner: EthPrecompiles,
     modules: &'static [Module],
     profile: Profile,
+    /// Active precompiles this crate does not run: a call that reaches one
+    /// makes its transaction one no block here can carry.
+    refused: Vec<Address>,
 }
 
 impl Precompiles {
@@ -448,7 +509,14 @@ impl Precompiles {
             inner: EthPrecompiles::new(spec),
             modules: MODULES,
             profile,
+            refused: Vec::new(),
         }
+    }
+
+    /// The same set, refusing a call to any of `refused`.
+    pub fn refusing(mut self, refused: Vec<Address>) -> Self {
+        self.refused = refused;
+        self
     }
 
     /// The module registered at `address`, if one is.
@@ -536,6 +604,14 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for Precompiles {
         context: &mut CTX,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
+        if self.refused.contains(&inputs.bytecode_address) {
+            // An error here is not a revert: it ends the transaction, which
+            // `block::apply` then refuses.
+            return Err(format!(
+                "a call to the stateful precompile at {}, which this node does not run",
+                inputs.bytecode_address
+            ));
+        }
         if let Some(m) = self.module(&inputs.bytecode_address) {
             // A module answers alone. The gate is not consulted because Go's
             // does not classify it — see `Precompiles::op`.

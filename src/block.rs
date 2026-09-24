@@ -35,15 +35,20 @@ use revm::context::{Context, ContextSetters, ContextTr, Evm, TxEnv};
 use revm::context_interface::JournalTr;
 use revm::handler::instructions::EthInstructions;
 use revm::handler::Handler as _;
-use revm::primitives::hardfork::SpecId;
 use revm::{DatabaseCommit as _, MainContext};
 
 use crate::fee;
 use crate::header;
+use crate::precompile::{self, Activation};
 use crate::root;
 use crate::rules::{Chain, WARP};
 use crate::state::World;
 use crate::{Handler, Precompiles, Profile};
+
+/// EIP-4788's beacon-roots contract, which a Cancun header's parent beacon
+/// root is handed to before the first transaction.
+pub const BEACON_ROOTS: Address =
+    alloy_primitives::address!("0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02");
 
 /// What a block is executed under: the chain's configuration, and the values
 /// its header carries — every one of which Go derives from the parent.
@@ -60,16 +65,20 @@ pub struct Env {
     /// this replays every transaction onto whichever network it was compiled
     /// for.
     pub chain_id: u64,
-    pub spec: SpecId,
     /// Which precompiles are admitted.
     pub profile: Profile,
     /// The fee schedule every header field below is derived under.
     pub fee: fee::Config,
+    /// The blob schedule under Cancun.
+    pub blob: fee::Blob,
+    /// The stateful precompiles the chain turns on, and when.
+    pub activations: Vec<Activation>,
     /// `allowFeeRecipients`: a builder may name its own coinbase.
     pub allow_fee_recipients: bool,
     /// The coinbase. A builder's is its fee recipient where the chain allows
     /// one and [`fee::BLACKHOLE`] otherwise — also Go's when none is set.
     pub beneficiary: Address,
+    pub number: u64,
     pub timestamp: u64,
     pub gas_limit: u64,
     pub base_fee: u64,
@@ -81,6 +90,13 @@ pub struct Env {
     /// The block gas cost the block is under, derived from its parent's
     /// ([`fee::cost`]). The header carries it when it is not zero.
     pub block_gas_cost: u64,
+    /// From Shanghai, the (empty) withdrawals root.
+    pub withdrawals_root: Option<B256>,
+    /// From Cancun, the blob gas used (zero), the excess blob gas and the
+    /// parent beacon root.
+    pub blob_gas_used: Option<u64>,
+    pub excess_blob_gas: Option<u64>,
+    pub parent_beacon_root: Option<B256>,
 }
 
 impl Env {
@@ -88,17 +104,26 @@ impl Env {
     ///
     /// Every field Go derives, derived: the gas limit (`header.GasLimit`), the
     /// base fee, the block gas cost and the extra (see [`fee`]). And the ones
-    /// its builder fixes: difficulty 1, a zero mix digest, and the blackhole
-    /// for a coinbase unless the chain lets a builder name its fee recipient
-    /// (miner/worker.go:135-205 `commitNewWork`). Refused before the EVM
-    /// upgrade, whose rules this crate does not run.
+    /// its builder fixes: difficulty 1, a zero mix digest, the blackhole for a
+    /// coinbase unless the chain lets a builder name its fee recipient
+    /// (miner/worker.go:135-205 `commitNewWork`); from Shanghai an empty
+    /// withdrawals root (consensus.go:420-423), and from Cancun zero blob gas
+    /// used, the excess blob gas `CalcExcessBlobGas` gives, and a zero parent
+    /// beacon root — the worker's `beaconRoot` (miner/worker.go:121, 174-185).
+    /// Refused before the EVM upgrade, whose rules this crate does not run.
     pub fn next(&self, parent: &header::Lux, time: u64) -> Result<Self, fee::Error> {
-        if !self.chain.at(time).evm {
+        let rules = self.chain.at(time);
+        if !rules.evm {
             return Err(fee::Error::PreEvm);
         }
         let head = &parent.header;
         let window = fee::window(&self.chain, head, time)?;
         Ok(Self {
+            number: head.number + 1,
+            withdrawals_root: rules.shanghai.then_some(root::EMPTY),
+            blob_gas_used: rules.cancun.then_some(0),
+            excess_blob_gas: rules.cancun.then(|| fee::excess(&self.blob, head)),
+            parent_beacon_root: rules.cancun.then_some(B256::ZERO),
             timestamp: time,
             gas_limit: self.fee.gas_limit,
             base_fee: fee::base_fee(&self.chain, &self.fee, head, time)?,
@@ -113,6 +138,25 @@ impl Env {
             },
             ..self.clone()
         })
+    }
+
+    /// Whether the precompile at `address` is active in this block.
+    pub fn active(&self, address: &Address) -> bool {
+        self.activations
+            .iter()
+            .any(|a| &a.address == address && a.at <= self.timestamp)
+    }
+
+    /// The active precompiles this crate does not run.
+    fn refused(&self) -> Vec<Address> {
+        self.activations
+            .iter()
+            .filter(|a| {
+                a.at <= self.timestamp
+                    && !precompile::MODULES.iter().any(|m| m.address == a.address)
+            })
+            .map(|a| a.address)
+            .collect()
     }
 }
 
@@ -240,6 +284,14 @@ pub fn rule(
             next.block_gas_cost
         ));
     }
+    // The post-merge fields are read, not derived: Go checks only that no
+    // blob gas is used (above), and runs the block under the excess blob gas
+    // and the parent beacon root its header carries (core/evm.go:71-79,
+    // core/state_processor.go:112-114).
+    next.withdrawals_root = h.withdrawals_root;
+    next.blob_gas_used = h.blob_gas_used;
+    next.excess_blob_gas = h.excess_blob_gas;
+    next.parent_beacon_root = h.parent_beacon_block_root;
     // consensus.go:106-127 and core/blockchain_reader.go:418-431: any coinbase
     // where fee recipients are allowed, the blackhole where they are not.
     if env.allow_fee_recipients {
@@ -272,6 +324,9 @@ pub enum Invalid {
     /// Its access list names the warp precompile while warp is on, which makes
     /// it a predicate Go verifies and prices, and this crate does not.
     Predicate,
+    /// A blob transaction. No Lux block carries a blob: its header's blob gas
+    /// used must be zero (consensus.go:217-224, block_validator.go:84-101).
+    Blob,
     /// The header is not the one Go derives from its parent ([`rule`]).
     Header(String),
     /// The block's tips do not cover its block gas cost ([`fee::covered`]).
@@ -288,6 +343,7 @@ impl core::fmt::Display for Invalid {
             }
             Invalid::Rejected(why) => write!(f, "{why}"),
             Invalid::Predicate => write!(f, "a warp predicate, which this node does not verify"),
+            Invalid::Blob => write!(f, "a blob transaction, which no Lux block carries"),
             Invalid::Header(why) => write!(f, "header: {why}"),
             Invalid::Fee(why) => write!(f, "{why}"),
         }
@@ -331,7 +387,10 @@ pub fn apply(
             });
         }
     }
-    if env.chain.at(env.timestamp).warp
+    if tx.is_eip4844() {
+        return Err(Invalid::Blob);
+    }
+    if env.active(&WARP)
         && tx
             .access_list()
             .is_some_and(|l| l.iter().any(|item| item.address == WARP))
@@ -401,7 +460,7 @@ pub fn run(
     tx: TxEnv,
     checks: Checks,
 ) -> Result<(ExecutionResult, revm::state::EvmState), Invalid> {
-    let spec = env.spec;
+    let spec = env.chain.spec(env.timestamp);
     let relaxed = checks == Checks::Simulated;
     // The context borrows the world for exactly this transaction. Access lists
     // and warm slots are per-transaction state and are meant to be dropped
@@ -421,6 +480,7 @@ pub fn run(
             c.disable_eip3607 = relaxed;
         })
         .modify_block_chained(|b| {
+            b.number = U256::from(env.number);
             b.beneficiary = env.beneficiary;
             b.timestamp = U256::from(env.timestamp);
             b.basefee = env.base_fee;
@@ -430,11 +490,19 @@ pub fn run(
             // Shanghai on (core/evm.go:82-89), so PREVRANDAO answers 1 on
             // every Lux block, not the mix digest.
             b.prevrandao = Some(B256::from(env.difficulty));
+            // BLOBBASEFEE answers `CalcBlobFee` of the header's excess blob
+            // gas (core/evm.go:71-79). A Cancun header without one leaves Go
+            // with none, and its opcode dereferences nil; revm needs a value
+            // under Cancun, and zero excess is the only one a Lux chain has.
+            b.set_blob_excess_gas_and_price(
+                env.excess_blob_gas.unwrap_or_default(),
+                env.blob.fraction,
+            );
         });
     let mut evm = Evm::new(
         ctx,
         EthInstructions::new_mainnet_with_spec(spec),
-        Precompiles::new(spec, env.profile),
+        Precompiles::new(spec, env.profile).refusing(env.refused()),
     );
     evm.ctx.set_tx(tx);
 
@@ -477,6 +545,65 @@ impl Built {
     }
 }
 
+/// What a block does before its first transaction, in the order Go's
+/// `Process` does it (core/state_processor.go:84-114): the activation marker of
+/// every precompile whose time the transition from `parent` crosses
+/// ([`precompile::Activation`]); then, where the header carries a parent
+/// beacon root, EIP-4788's system call handing it to the beacon-roots
+/// contract (`ProcessBeaconBlockRoot`, :290-306) — which changes nothing
+/// where the contract has no code, as a call to an empty account changes
+/// nothing in Go. The parent's hash is also remembered for `BLOCKHASH`.
+///
+/// Both the proposer and the verifier call this, before [`apply`].
+pub fn begin(world: &mut World, env: &Env, parent: &header::Lux) -> Result<(), Invalid> {
+    world.remember(parent.header.number, parent.seal());
+    for a in &env.activations {
+        if a.crossed(Some(parent.header.timestamp), env.timestamp) {
+            precompile::mark(world, a.address);
+        }
+    }
+    let Some(root) = env.parent_beacon_root else {
+        return Ok(());
+    };
+    if world
+        .get(&BEACON_ROOTS)
+        .is_none_or(|a| a.code_hash == crate::state::Account::default().code_hash)
+    {
+        return Ok(());
+    }
+    use revm::handler::SystemCallEvm as _;
+    let spec = env.chain.spec(env.timestamp);
+    let ctx = Context::mainnet()
+        .with_db(&mut *world)
+        .modify_cfg_chained(|c| {
+            c.spec = spec;
+            c.chain_id = env.chain_id;
+        })
+        .modify_block_chained(|b| {
+            b.number = U256::from(env.number);
+            b.beneficiary = env.beneficiary;
+            b.timestamp = U256::from(env.timestamp);
+            b.basefee = env.base_fee;
+            b.gas_limit = env.gas_limit;
+            b.difficulty = env.difficulty;
+            b.prevrandao = Some(B256::from(env.difficulty));
+            b.set_blob_excess_gas_and_price(
+                env.excess_blob_gas.unwrap_or_default(),
+                env.blob.fraction,
+            );
+        });
+    let mut evm = Evm::new(
+        ctx,
+        EthInstructions::new_mainnet_with_spec(spec),
+        Precompiles::new(spec, env.profile).refusing(env.refused()),
+    );
+    let done = evm
+        .system_call(BEACON_ROOTS, Bytes::copy_from_slice(root.as_slice()))
+        .map_err(|e| Invalid::Rejected(format!("the beacon-root system call: {e:?}")))?;
+    world.commit(done.state);
+    Ok(())
+}
+
 /// Execute a whole block strictly: every transaction must be executable.
 ///
 /// This is the verifier's composition. A proposer wants the permissive one and
@@ -488,6 +615,7 @@ pub fn execute(
     env: &Env,
     txs: Vec<(TxEnvelope, Address)>,
 ) -> Result<Built, Invalid> {
+    begin(world, env, parent)?;
     let mut receipts = Vec::with_capacity(txs.len());
     let mut kept = Vec::with_capacity(txs.len());
     let mut cumulative = 0u64;
@@ -543,13 +671,14 @@ pub fn finish(
         mix_hash: env.mix_hash,
         nonce: B64::ZERO,
         base_fee_per_gas: Some(env.base_fee),
-        // No post-London tail: a block here is "17" or "19 lux", and neither
-        // has a position for one.
+        withdrawals_root: env.withdrawals_root,
+        blob_gas_used: env.blob_gas_used,
+        excess_blob_gas: env.excess_blob_gas,
+        parent_beacon_block_root: env.parent_beacon_root,
         ..Default::default()
     };
     Ok(Built {
-        // Every block but the genesis is in a Lux shape. The genesis is built
-        // by `genesis::Genesis`, never here.
+        // The genesis is built by `genesis::Genesis`, never here.
         header: header::Lux::block(fields, U256::from(env.block_gas_cost)),
         transactions,
         receipts,
@@ -859,7 +988,10 @@ mod tests {
             vec![paying(1, env.chain_id, U256::from(1u64), 500_000_000_000)],
         )
         .expect("the tip covers the cost");
-        assert_eq!(second.header.layout.name, "19 lux", "a cost is carried");
+        assert_eq!(
+            second.header.layout.name, "23",
+            "a cost is carried, after Cancun"
+        );
         assert_eq!(second.header.block_gas_cost, Some(U256::from(400_000u64)));
         rule(&g.env(), &built.header, &second.header, NOW).expect("passes");
     }
@@ -941,7 +1073,7 @@ mod tests {
             ("mix digest", |h| h.header.mix_hash = B256::repeat_byte(1)),
             ("uncle hash", |h| h.header.ommers_hash = B256::ZERO),
             ("block gas cost", |h| {
-                h.layout = header::named("19 lux");
+                h.layout = header::named("23");
                 h.block_gas_cost = Some(U256::from(1u64));
                 h.ext_data_hash = Some(B256::ZERO);
                 h.ext_data_gas_used = Some(Bytes::new());
@@ -1008,7 +1140,7 @@ mod tests {
         .expect("second");
         assert_eq!(cost_of(&second.header), Some(400_000));
         let bare = header::Lux::block(second.fields().clone(), U256::ZERO);
-        assert_eq!(bare.layout.name, "17");
+        assert_eq!(bare.layout.name, "20 eth");
         let refused = rule(&g.env(), &first.header, &bare, NOW);
         assert!(matches!(refused, Err(Invalid::Header(_))), "{refused:?}");
     }
@@ -1063,25 +1195,230 @@ mod tests {
         };
         let sig = sign(tx.signature_hash());
         let tx = TxEnvelope::Eip1559(tx.into_signed(sig));
-        let on = Env {
-            chain: Chain {
-                warp: Some(env.timestamp),
-                ..env.chain
-            },
+        let at = |t: u64| Env {
+            activations: vec![Activation {
+                address: WARP,
+                at: t,
+            }],
             ..env.clone()
         };
         assert_eq!(
-            apply(&mut world.clone(), &on, 0, &tx, who()).err(),
+            apply(&mut world.clone(), &at(env.timestamp), 0, &tx, who()).err(),
             Some(Invalid::Predicate)
         );
-        let before = Env {
-            chain: Chain {
-                warp: Some(env.timestamp + 1),
-                ..env.chain
-            },
+        apply(&mut world, &at(env.timestamp + 1), 0, &tx, who())
+            .expect("an access list, not yet a predicate");
+    }
+
+    /// A call to `to` from the test key, at `nonce`.
+    fn calling(nonce: u64, env: &Env, to: Address, input: Bytes) -> TxEnvelope {
+        let tx = TxEip1559 {
+            chain_id: env.chain_id,
+            nonce,
+            gas_limit: 200_000,
+            max_fee_per_gas: 30_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(to),
+            input,
+            ..Default::default()
+        };
+        let sig = sign(tx.signature_hash());
+        TxEnvelope::Eip1559(tx.into_signed(sig))
+    }
+
+    #[test]
+    fn a_call_to_an_active_precompile_this_crate_does_not_run_is_refused() {
+        let (mut world, _parent, env, _) = chain();
+        let dex = precompile::ALWAYS_ON[0].address;
+        let at = |t: u64| Env {
+            activations: vec![Activation {
+                address: dex,
+                at: t,
+            }],
             ..env.clone()
         };
-        apply(&mut world, &before, 0, &tx, who()).expect("an access list, not yet a predicate");
+        let tx = calling(0, &env, dex, Bytes::new());
+        let refused = apply(&mut world.clone(), &at(env.timestamp), 0, &tx, who());
+        assert!(
+            matches!(&refused, Err(Invalid::Rejected(why)) if why.contains("does not run")),
+            "{refused:?}"
+        );
+        apply(&mut world, &at(env.timestamp + 1), 0, &tx, who()).expect("not yet active");
+    }
+
+    #[test]
+    fn an_activation_writes_its_marker_on_the_block_that_crosses_it() {
+        let (mut world, parent, env, _) = chain();
+        let dex = precompile::ALWAYS_ON[0].address;
+        let at = |t: u64| Env {
+            activations: vec![Activation {
+                address: dex,
+                at: t,
+            }],
+            ..env.clone()
+        };
+        let mut before = world.clone();
+        begin(&mut before, &at(env.timestamp + 1), &parent).expect("begins");
+        assert!(before.get(&dex).is_none(), "not crossed yet");
+        begin(&mut world, &at(env.timestamp), &parent).expect("begins");
+        let a = world.get(&dex).expect("marked");
+        assert_eq!(
+            (a.nonce, world.code(&dex).original_byte_slice()),
+            (1, &precompile::MARKER[..])
+        );
+    }
+
+    #[test]
+    fn a_blob_transaction_is_not_in_a_block() {
+        let (mut world, _parent, env, _) = chain();
+        let tx = alloy_consensus::TxEip4844 {
+            chain_id: env.chain_id,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 30_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TO,
+            max_fee_per_blob_gas: 1,
+            blob_versioned_hashes: vec![B256::repeat_byte(1)],
+            ..Default::default()
+        };
+        let sig = sign(tx.signature_hash());
+        let tx: TxEnvelope = tx.into_signed(sig).into();
+        assert_eq!(
+            apply(&mut world, &env, 0, &tx, who()).err(),
+            Some(Invalid::Blob)
+        );
+    }
+
+    #[test]
+    fn the_fork_is_the_one_the_block_time_selects() {
+        use revm::primitives::hardfork::SpecId;
+        let late = funded().timestamp + 100;
+        let g = genesis::Genesis {
+            chain: Chain {
+                cancun: Some(late),
+                ..Chain::lux()
+            },
+            ..funded()
+        };
+        let parent = g.sealed();
+        let shanghai = g.env().next(&parent, late - 1).expect("derives");
+        assert_eq!(g.chain.spec(late - 1), SpecId::SHANGHAI);
+        let mut world = g.world();
+        let built = execute(
+            &mut world,
+            &parent,
+            &shanghai,
+            vec![send(0, g.chain_id, U256::ZERO)],
+        )
+        .expect("a Shanghai block");
+        assert_eq!(built.header.layout.name, "17, withdrawals");
+        assert_eq!(built.fields().withdrawals_root, Some(root::EMPTY));
+        assert_eq!(built.fields().excess_blob_gas, None);
+        let cancun = g.env().next(&built.header, late).expect("derives");
+        assert_eq!(g.chain.spec(late), SpecId::CANCUN);
+        let tip = 500_000_000_000;
+        let next = execute(
+            &mut world,
+            &built.header,
+            &cancun,
+            vec![paying(1, g.chain_id, U256::ZERO, tip)],
+        )
+        .expect("a Cancun block");
+        assert_eq!(next.header.layout.name, "23", "Cancun, owing a cost");
+        assert_eq!(next.fields().blob_gas_used, Some(0));
+        assert_eq!(next.fields().excess_blob_gas, Some(0));
+        assert_eq!(next.fields().parent_beacon_block_root, Some(B256::ZERO));
+        rule(&g.env(), &built.header, &next.header, NOW).expect("passes");
+    }
+
+    #[test]
+    fn cancun_answers_as_go_does() {
+        // TSTORE 42 at 7, TLOAD 7 to memory 0; MCOPY it to 32; BLOBBASEFEE to
+        // 64, BLOBHASH(0) to 96, NUMBER to 128; return all five words.
+        let code = Bytes::from_static(&[
+            0x60, 0x2a, 0x60, 0x07, 0x5d, // tstore(7, 42)
+            0x60, 0x07, 0x5c, 0x5f, 0x52, // mstore(0, tload(7))
+            0x60, 0x20, 0x5f, 0x60, 0x20, 0x5e, // mcopy(32, 0, 32)
+            0x4a, 0x60, 0x40, 0x52, // mstore(64, blobbasefee)
+            0x5f, 0x49, 0x60, 0x60, 0x52, // mstore(96, blobhash(0))
+            0x43, 0x60, 0x80, 0x52, // mstore(128, number)
+            0x60, 0xa0, 0x5f, 0xf3, // return(0, 160)
+        ]);
+        let (mut world, _parent, env, _) = chain();
+        let at = address!("00000000000000000000000000000000000000aa");
+        let bytecode = revm::bytecode::Bytecode::new_raw(code);
+        world.insert(
+            at,
+            crate::state::Account {
+                code_hash: bytecode.hash_slow(),
+                ..Default::default()
+            },
+            Some(bytecode),
+        );
+        let out = call(
+            world,
+            &env,
+            TxEnv::builder()
+                .caller(who())
+                .kind(TxKind::Call(at))
+                .gas_limit(100_000)
+                .nonce(0)
+                .chain_id(None)
+                .build_fill(),
+        )
+        .expect("runs");
+        assert!(out.is_success(), "{out:?}");
+        let words: Vec<U256> = out
+            .into_output()
+            .unwrap_or_default()
+            .chunks(32)
+            .map(U256::from_be_slice)
+            .collect();
+        assert_eq!(
+            words,
+            vec![
+                U256::from(42u64),
+                U256::from(42u64),
+                U256::from(1u64),
+                U256::ZERO,
+                U256::from(env.number)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_parent_beacon_root_reaches_the_beacon_roots_contract() {
+        // EIP-4788's contract, as deployed on Ethereum.
+        let code = Bytes::from(alloy_primitives::hex::decode(
+            "3373fffffffffffffffffffffffffffffffffffffffe14604d57602036146024575f5ffd5b5f35801560495762001fff810690815414603c575f5ffd5b62001fff01545f5260205ff35b5f5ffd5b62001fff42064281555f359062001fff015500",
+        ).expect("hex"));
+        let (mut world, parent, env, _) = chain();
+        let bytecode = revm::bytecode::Bytecode::new_raw(code);
+        world.insert(
+            BEACON_ROOTS,
+            crate::state::Account {
+                nonce: 1,
+                code_hash: bytecode.hash_slow(),
+                ..Default::default()
+            },
+            Some(bytecode),
+        );
+        let root = B256::repeat_byte(0x42);
+        let with = Env {
+            parent_beacon_root: Some(root),
+            ..env.clone()
+        };
+        begin(&mut world, &with, &parent).expect("begins");
+        let slot = U256::from(env.timestamp % 8191);
+        assert_eq!(
+            world.storage(&BEACON_ROOTS, slot),
+            U256::from(env.timestamp)
+        );
+        assert_eq!(
+            world.storage(&BEACON_ROOTS, slot + U256::from(8191u64)),
+            U256::from_be_bytes(root.0)
+        );
     }
 
     #[test]

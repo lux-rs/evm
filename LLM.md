@@ -14,8 +14,9 @@ names a block the way the network names it.
 - `src/trie.rs` — a Merkle-Patricia trie whose nodes never change once made.
 - `src/fee.rs` — the fee window, base fee, block gas cost, extra and block
   fee: every header field Go derives from the parent.
-- `src/block.rs` — `run` (the ONE interpreter call), `apply`, `execute`, `call`;
-  `Env::next` (a child's environment, derived) and `rule` (Go's header rule).
+- `src/block.rs` — `run` (the ONE interpreter call), `begin` (what a block does
+  before its first transaction), `apply`, `execute`, `call`; `Env::next` (a
+  child's environment, derived) and `rule` (Go's header rule).
 - `src/header.rs` — every header shape Go's `DecodeHeader` reads, and their RLP.
 - `src/genesis.rs` — block zero, as a document.
 - `tests/headers.rs` — 21 real mainnet headers, decoded and re-named, and Go's
@@ -111,6 +112,29 @@ names a block the way the network names it.
 - **PREVRANDAO is the header's difficulty.** Go's block context sets Random
   to `header.Difficulty` from Shanghai on (core/evm.go:82-89), so the opcode
   answers 1 on every Lux block; revm's default, the mix digest, answers 0.
+
+- **The fork is the block's, from the genesis schedule.** `Chain::spec`:
+  Cancun from `cancunTime`, else Shanghai from `shanghaiTime`, else Paris —
+  with Shanghai = Durango and Cancun = Quasar where those are scheduled
+  (`SetEthUpgrades`). A Cancun block runs TSTORE/TLOAD, MCOPY, EIP-6780 and
+  the blob opcodes under revm's CANCUN; BLOBBASEFEE is `CalcBlobFee` of the
+  header's excess (1 wei — no Lux block carries a blob); a blob transaction is
+  refused (`Invalid::Blob`). Its header carries what Go's builder fills: an
+  empty withdrawals root (Shanghai), zero blob gas used, the derived excess
+  and a zero parent beacon root — "20 eth", or "23" when it owes a cost; a
+  Shanghai-only one is "17, withdrawals" in a block with its empty
+  withdrawals. `begin` hands the parent beacon root to EIP-4788's contract
+  (a no-op where it has no code) and remembers the parent's hash. A block's
+  NUMBER reaches revm (it did not before: NUMBER answered 0 and BLOCKHASH
+  nothing).
+
+- **A stateful precompile is marked when it turns on, and a call to one
+  this crate does not run is refused.** `Env.activations` (config keys and
+  the AlwaysOn DEX settlement precompile at 1766704800): the block whose
+  transition crosses one writes nonce 1 and code 0x01, at the genesis when not
+  after it (before the allocation, which wins). Go then answers calls there;
+  this crate answers the BLS12-381 `MODULES` and makes any other call — warp,
+  DEX settlement — an error that refuses the transaction.
 
 - **A warp predicate is refused, not verified.** Once `warpConfig` is on, a
   transaction whose access list names 0x0200…05 is a predicate Go prices and

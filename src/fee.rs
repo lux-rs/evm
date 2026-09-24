@@ -121,6 +121,46 @@ impl Config {
     }
 }
 
+/// A chain's blob schedule under Cancun: `blobSchedule.cancun`, or
+/// `DefaultCancunBlobConfig` where the document gives none.
+///
+/// No block on a Lux chain carries a blob — a blob transaction is refused, and
+/// a header's `blobGasUsed` must be zero — so the excess stays at zero and the
+/// price at its floor, one wei. The schedule still names both, because
+/// BLOBBASEFEE answers the price and a header carries the excess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Blob {
+    pub target: u64,
+    pub max: u64,
+    pub fraction: u64,
+}
+
+impl Blob {
+    /// `params.DefaultCancunBlobConfig`.
+    pub const CANCUN: Self = Self {
+        target: 3,
+        max: 6,
+        fraction: 3_338_477,
+    };
+}
+
+/// Blob gas per blob: `params.BlobTxBlobGasPerBlob`.
+pub const BLOB_GAS: u64 = 1 << 17;
+
+/// The excess blob gas a Cancun block on top of `parent` carries:
+/// `eip4844.CalcExcessBlobGas` before Osaka (luxfi/geth v1.20.3
+/// consensus/misc/eip4844/eip4844.go:131-150). A parent without the field
+/// counts as zero.
+pub fn excess(blob: &Blob, parent: &Header) -> u64 {
+    let (excess, used) = match parent.excess_blob_gas {
+        Some(e) => (e, parent.blob_gas_used.unwrap_or_default()),
+        None => (0, 0),
+    };
+    let total = excess.wrapping_add(used);
+    let target = blob.target * BLOB_GAS;
+    total.saturating_sub(target)
+}
+
 /// The gas used in each of the last [`WINDOW_LEN`] seconds, oldest first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Window(pub [u64; WINDOW_LEN]);
@@ -507,6 +547,24 @@ mod tests {
         assert_eq!(e.len(), 86);
         assert_eq!(&e[..80], &w.bytes()[..]);
         assert_eq!(&e[80..], &NO_PREDICATES);
+    }
+
+    #[test]
+    fn the_excess_blob_gas_falls_to_zero_below_the_target() {
+        let b = Blob::CANCUN;
+        assert_eq!(excess(&b, &Header::default()), 0, "no field is zero");
+        let parent = Header {
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(excess(&b, &parent), 0);
+        let full = Header {
+            excess_blob_gas: Some(BLOB_GAS),
+            blob_gas_used: Some(6 * BLOB_GAS),
+            ..Default::default()
+        };
+        assert_eq!(excess(&b, &full), 4 * BLOB_GAS);
     }
 
     #[test]
