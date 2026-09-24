@@ -20,7 +20,7 @@ and nothing else:
 | `handler`    | those rules in the two `Handler` methods that ask about them       |
 | `gas`        | what a transaction owes before a single opcode runs                |
 | `precompile` | the stock precompiles behind the classical-family gate             |
-| `header`     | how a block is named: `keccak256(rlp(header))`                     |
+| `header`     | how a block is named: every header shape Go reads, and its RLP     |
 | `root`       | what a block commits to: the transaction, receipt and state tries  |
 
 The rules, with the Go they come from:
@@ -47,6 +47,9 @@ vectors directory, or leave it and the harness looks beside this crate:
 
 - the genesis header built in Rust encodes to **byte-identical RLP** and seals
   to the block hash the live node reports;
+- every header shape Go's `DecodeHeader` reads (`evm_header_layouts.json`, 15
+  to 24 fields) is read to the same fields and the same name, and every one it
+  refuses is refused;
 - the transactions root over five signed transactions of four types is the root
   Go derives, including the EIP-2718 envelopes that are easy to wrap wrongly;
 - intrinsic gas for calldata, zero bytes and deployment, and both deployment
@@ -63,8 +66,6 @@ And as unit tests, the rules and the family classification on their own.
 
 ## What is not here yet
 
-- **A `Database` over real state.** The trie functions compute roots from
-  accounts; nothing yet holds those accounts across blocks.
 - **The post-quantum precompiles** at `0x012201`–`0x012208` and `0x012220`.
   They are not active on any chain serving traffic today. When they are, the
   right move is to dispatch them to `libluxprecompile.so` rather than write

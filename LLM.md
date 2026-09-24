@@ -12,9 +12,10 @@ names a block the way the network names it.
 - `src/precompile.rs` — which precompile answers where, and at what price.
 - `src/state.rs` — the world the roots are taken over.
 - `src/block.rs` — `run` (the ONE interpreter call), `apply`, `execute`, `call`.
-- `src/header.rs` — the three shapes a C-chain header has, and their RLP.
+- `src/header.rs` — every header shape Go's `DecodeHeader` reads, and their RLP.
 - `src/genesis.rs` — block zero, as a document.
-- `tests/headers.rs` — 21 real mainnet headers, decoded and re-named.
+- `tests/headers.rs` — 21 real mainnet headers, decoded and re-named, and Go's
+  own reading of every shape (`evm_header_layouts.json`).
 
 ## Decisions worth not relitigating
 
@@ -28,14 +29,26 @@ names a block the way the network names it.
   out of `World` unchanged. A live node's own numbers are checked too — see the
   node repo's `genesis::luxd_conformance`.
 
-- **A block is named by the SHAPE it is.** The C-chain has accepted three:
-  16 fields at genesis (through `baseFeePerGas`), 17 for ordinary blocks
-  (`blockGasCost`), and 20 later (`withdrawalsRoot`, `blobGasUsed`,
-  `excessBlobGas`, `parentBeaconBlockRoot`). The seventeenth position is a
-  QUANTITY in one shape and a HASH in another, so the shape is read per header
-  rather than declared once. `header::Lux` encodes and DECODES all three —
-  decoding matters, because alloy alone takes a seventeenth field for a
-  withdrawals root and refuses it for being the wrong width.
+- **A header is read the way Go's `DecodeHeader` reads it.** Its field count
+  names the candidate shapes and they are tried in `luxfi/geth`
+  `core/types/decode.go`'s order — coreth's (ExtDataHash at position 15) before
+  Lux's (base fee there), Lux's 20 and 21 before Ethereum's — the first that
+  reads every position winning. That order is data: `header::LAYOUTS`, 15 to
+  24 fields, plus the two shapes `DecodeBlock` makes of a 17-field header when
+  its block has a fourth item (the hash becomes the withdrawals root). A header
+  keeps its `Layout` and re-encodes to the bytes it arrived as. Held to Go by
+  `evm_header_layouts.json` (luxfi/conformance, Go's own oracle, 40 cases) here
+  and in the node.
+
+- **The ordinary block is `[baseFee, ""]` — seventeen fields, the seventeenth
+  an ABSENT ExtDataHash.** Not `blockGasCost`: an integer there is a header Go
+  refuses ("input string too short for common.Hash"). Every Lux, Zoo and SPC
+  block on record is this shape, the genesis is 16, and mainnet from 1,082,781
+  is the 20-field Ethereum Cancun shape. `Lux::block` writes "17" for a zero
+  cost and, for a non-zero one, "19 lux" — the shape Go's `EncodeRLP19Lux`
+  writes. A base fee is 64 bits here (revm's block environment); Go reads any
+  width and refuses past 256 bits in SyntacticVerify, so a 65–256-bit base fee
+  is refused here and read there. No fee schedule these chains run reaches it.
 
 - **The RPC lies in both directions about the header.**
   `eth_getBlockByNumber` REPORTS `blockGasCost` for a block whose preimage does

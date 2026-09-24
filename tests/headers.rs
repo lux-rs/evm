@@ -75,9 +75,9 @@ fn every_accepted_header_is_named_what_the_network_named_it() {
 
 #[test]
 fn the_shape_is_read_off_the_header_not_declared_once() {
-    // Three shapes, and the seventeenth field is a quantity in one and a hash
-    // in another. A node that declared one layout would hash two of the three
-    // wrongly.
+    // Two shapes on record, 17 and 20, and their seventeenth fields are
+    // different things: an absent ExtDataHash in one, the withdrawals root in
+    // the other. A node that declared one layout would read one of them wrongly.
     let mut seen = std::collections::BTreeSet::new();
     for b in &history() {
         let h = Lux::read(&rlp_of(b)).expect("decodes");
@@ -87,9 +87,13 @@ fn the_shape_is_read_off_the_header_not_declared_once() {
             "block {} field count",
             at(b, "number")
         );
-        seen.insert(b["shape"].as_str().unwrap_or("?").to_string());
+        seen.insert(h.layout.name);
     }
-    assert_eq!(seen.len(), 3, "the corpus carries three shapes: {seen:?}");
+    assert_eq!(
+        seen,
+        ["16", "17", "20 eth"].into(),
+        "the corpus carries three shapes"
+    );
 }
 
 #[test]
@@ -106,17 +110,17 @@ fn the_genesis_is_the_only_sixteen_field_block() {
 }
 
 #[test]
-fn dropping_the_lux_field_renames_an_ordinary_block() {
-    // The reason this module exists. A 17-field block hashed under the 16-field
-    // shape — which is what hashing the plain header does — is a different
-    // name, and a node producing it has forked at block one.
+fn dropping_the_seventeenth_field_renames_an_ordinary_block() {
+    // The reason this module exists. An ordinary block's seventeenth field is
+    // there and empty, and a header hashed without it — the plain 16-field
+    // header — is a different name: a node producing it has forked at block one.
     let blocks = history();
     let one = blocks
         .iter()
         .find(|b| at(b, "number") == 1)
         .expect("block 1");
     let lux = Lux::read(&rlp_of(one)).expect("decodes");
-    assert!(lux.block_gas_cost.is_some(), "block 1 carries blockGasCost");
+    assert_eq!(lux.fields(), 17);
     assert_eq!(lux.seal(), hash(one, "hash"));
     assert_ne!(
         header::seal(&lux.header),
@@ -154,19 +158,93 @@ fn a_header_that_is_only_a_genesis_shape_still_seals_the_old_way() {
 }
 
 #[test]
-fn the_seventeenth_field_is_a_quantity_and_the_twentieth_shape_has_none() {
-    let blocks = history();
-    for b in &blocks {
+fn the_seventeenth_field_is_an_absent_ext_data_hash_and_carries_no_block_gas_cost() {
+    // The corpus labels the ordinary shape `blockGasCost`; Go does not read it
+    // so. `DecodeHeader` takes a 17-field header's seventeenth as ExtDataHash,
+    // and the empty string there as absent — so an ordinary block has neither.
+    for b in &history() {
         let h = Lux::read(&rlp_of(b)).expect("decodes");
-        let shape = b["shape"].as_str().unwrap_or("");
-        if shape.contains("blockGasCost") {
-            assert!(h.block_gas_cost.is_some(), "block {}", at(b, "number"));
-            assert!(h.header.withdrawals_root.is_none());
-        }
-        if shape.contains("withdrawalsRoot") {
-            assert!(h.block_gas_cost.is_none(), "the two shapes are exclusive");
-            assert!(h.header.withdrawals_root.is_some());
+        match at(b, "fields") {
+            16 => assert_eq!(h.layout.name, "16"),
+            17 => {
+                assert_eq!(h.layout.name, "17", "block {}", at(b, "number"));
+                assert_eq!(h.ext_data_hash, None);
+                assert_eq!(h.block_gas_cost, None);
+            }
+            20 => {
+                assert_eq!(h.layout.name, "20 eth", "block {}", at(b, "number"));
+                assert!(h.header.withdrawals_root.is_some());
+                assert_eq!(h.block_gas_cost, None);
+            }
+            n => panic!("block {} has {n} fields", at(b, "number")),
         }
     }
-    let _ = B256::ZERO;
+}
+
+/// A header as Go's oracle reports one: its name, its field count, and every
+/// field `DecodeHeader` may leave nil, as `hexutil` writes it.
+fn answer(h: &Lux) -> Value {
+    let big = |b: &[u8]| {
+        let s = hex::encode(b);
+        let s = s.trim_start_matches('0');
+        format!("0x{}", if s.is_empty() { "0" } else { s })
+    };
+    let hash = |v: Option<B256>| v.map(|v| format!("{v:#x}"));
+    let u = &h.header;
+    serde_json::json!({
+        "hash": format!("{:#x}", h.seal()),
+        "fields": h.fields(),
+        "baseFeePerGas": u.base_fee_per_gas.map(|v| format!("{v:#x}")),
+        "blockGasCost": h.block_gas_cost.map(|v| format!("{v:#x}")),
+        "extDataHash": hash(h.ext_data_hash),
+        "extDataGasUsed": h.ext_data_gas_used.as_ref().map(|b| big(b)),
+        "blobGasUsed": u.blob_gas_used.map(|v| format!("{v:#x}")),
+        "excessBlobGas": u.excess_blob_gas.map(|v| format!("{v:#x}")),
+        "parentBeaconRoot": hash(u.parent_beacon_block_root),
+        "withdrawalsHash": hash(u.withdrawals_root),
+        "requestsHash": hash(u.requests_hash),
+    })
+}
+
+#[test]
+fn every_header_shape_go_reads_is_read_as_go_reads_it() {
+    // luxfi/geth `DecodeHeader` on every shape, from Go's own oracle: the
+    // fields each header decodes to and the name keccak256 of its bytes gives
+    // it, or Go's refusal. The cases wrapped in a block are `DecodeBlock`'s
+    // and belong to whoever reads blocks.
+    let doc = corpus("evm_header_layouts.json");
+    let mut n = 0;
+    for c in doc["cases"].as_array().expect("cases") {
+        if c.get("block_items").is_some() {
+            continue;
+        }
+        n += 1;
+        let name = c["name"].as_str().expect("a name");
+        let raw = bytes(c, "header");
+        let go = &c["go"];
+        let read = Lux::read(&raw);
+        if let Some(why) = go.get("error") {
+            assert!(
+                read.is_err(),
+                "{name}: Go refuses it ({why}), and this read it"
+            );
+            continue;
+        }
+        // Go reads a base fee of any width; revm's block environment holds 64
+        // bits, so a wider one is refused here while reading. Go refuses one
+        // past 256 bits in SyntacticVerify, and no fee schedule these chains
+        // run reaches 2^64.
+        if go["baseFeePerGas"].as_str().is_some_and(|f| f.len() > 18) {
+            assert!(read.is_err(), "{name}: a base fee past 64 bits is refused");
+            continue;
+        }
+        let h = read.unwrap_or_else(|e| panic!("{name}: Go reads it, and this refused it: {e}"));
+        assert_eq!(answer(&h), *go, "{name} ({})", h.layout.name);
+        assert_eq!(
+            h.encoded(),
+            raw,
+            "{name}: re-encodes to the bytes it arrived as"
+        );
+    }
+    assert!(n >= 30, "the corpus holds {n} header shapes");
 }
