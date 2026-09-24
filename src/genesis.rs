@@ -90,6 +90,25 @@ pub struct Genesis {
 }
 
 impl Genesis {
+    /// What Go refuses to start a chain on (`ChainConfig.Verify`, luxfi/evm
+    /// params/extras/config.go:485-512), where it can be decided here: the fee
+    /// schedule (`FeeConfig.Verify`), and a fee split with no governed
+    /// destination for the half it keeps — `verifyFeeSplit`
+    /// (params/extras/fee_split.go:38-58) requires fee recipients or the
+    /// reward manager, and the reward manager is not run here.
+    pub fn verify(&self) -> Result<(), String> {
+        self.fee.verify()?;
+        if let Some(at) = self.chain.split {
+            if !self.allow_fee_recipients {
+                return Err(format!(
+                    "feeSplitTimestamp is {at} but fee recipients are not allowed: half of every \
+                     fee would be burned and the other half stranded at the blackhole"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The state block zero commits to: the activation marker of every
     /// precompile turned on by the genesis time, then the allocation over it —
     /// Go's order (core/genesis.go:411-427), so an allocated account is the
@@ -339,6 +358,19 @@ mod tests {
         // a root that ignores the code hash — is a different number and a
         // chain that forked at genesis.
         assert_eq!(mainnet().world().root(), MAINNET_STATE_ROOT);
+    }
+
+    #[test]
+    fn go_refuses_to_start_mainnet_as_its_document_stands() {
+        // Lux mainnet's config splits fees from 1789430400 and names no
+        // destination for the kept half; luxd v1.37.9 refuses to start on it.
+        assert!(mainnet().verify().is_err());
+        let governed = Genesis {
+            allow_fee_recipients: true,
+            ..mainnet()
+        };
+        assert_eq!(governed.verify(), Ok(()));
+        assert_eq!(localnet().verify(), Ok(()));
     }
 
     #[test]

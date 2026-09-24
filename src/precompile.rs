@@ -494,7 +494,9 @@ fn pairing(input: &[u8]) -> Result<Bytes, PrecompileError> {
 #[derive(Clone, Debug)]
 pub struct Precompiles {
     inner: EthPrecompiles,
-    modules: &'static [Module],
+    /// The modules that answer: every one, or those [`Precompiles::serving`]
+    /// keeps — the ones the chain has turned on.
+    modules: Vec<&'static Module>,
     profile: Profile,
     /// Active precompiles this crate does not run: a call that reaches one
     /// makes its transaction one no block here can carry.
@@ -507,10 +509,18 @@ impl Precompiles {
     pub fn new(spec: SpecId, profile: Profile) -> Self {
         Self {
             inner: EthPrecompiles::new(spec),
-            modules: MODULES,
+            modules: MODULES.iter().collect(),
             profile,
             refused: Vec::new(),
         }
+    }
+
+    /// The same set, with only the modules at `active` answering. Go serves a
+    /// module only once its precompile is enabled (`IsPrecompileEnabled`);
+    /// before that its address is an account like any other.
+    pub fn serving(mut self, active: &[Address]) -> Self {
+        self.modules.retain(|m| active.contains(&m.address));
+        self
     }
 
     /// The same set, refusing a call to any of `refused`.
@@ -524,7 +534,7 @@ impl Precompiles {
     /// Asked before the Ethereum set on every path here, because that is the
     /// order `(*EVM).precompile` asks in.
     pub fn module(&self, address: &Address) -> Option<&'static Module> {
-        self.modules.iter().find(|m| &m.address == address)
+        self.modules.iter().copied().find(|m| &m.address == address)
     }
 
     /// The family the precompile at `address` belongs to, if one lives there.
@@ -658,15 +668,11 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for Precompiles {
         Ok(run)
     }
 
+    /// Ethereum's set for the fork, and nothing else: Go warms
+    /// `vm.ActivePrecompiles(rules)` (core/state_transition.go:524), which no
+    /// Lux module is in, so a module is cold until a transaction touches it.
     fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
-        let modules = self.modules;
-        Box::new(
-            self.inner
-                .precompiles
-                .addresses()
-                .cloned()
-                .chain(modules.iter().map(|m| m.address)),
-        )
+        Box::new(self.inner.precompiles.addresses().cloned())
     }
 
     fn contains(&self, address: &Address) -> bool {

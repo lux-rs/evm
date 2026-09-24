@@ -18,31 +18,31 @@
 //!   after the window, `predicate/predicate_results.go:148-208`;
 //! - the block fee: `consensus/dummy/consensus.go:262-320` (`verifyBlockFee`).
 //!
-//! WHERE A BLOCK'S COST LIVES. In its header, or nowhere: a header that
-//! carries none owes zero (consensus.go:169-175), and a header must carry
-//! exactly the cost its parent derives. So a chain's costs are its headers', a
-//! child's is derived from its parent's (none for the genesis, whose sixteen
-//! fields have no place for one), and nothing a node remembers beside a header
-//! enters the rule — the rule Go's import path, cevm and this crate share.
-//! What this crate builds carries its cost whenever it is not zero.
+//! WHERE A BLOCK'S COST LIVES. Go keeps it beside the header — a map keyed
+//! by the header's hash (`customtypes/header_ext.go:22-48`), persisted under
+//! `bgc` (`customrawdb/database_ext.go`) — and in the header only where the
+//! header has a place for it. Its builder writes the cost only into that map
+//! (`FinalizeAndAssemble`, consensus.go:366-434); its live VM fills a header's
+//! absent cost from the parent before verifying (`ensureBlockGasCost`,
+//! plugin/evm/block.go:288-319). This crate is that VM: a header that carries
+//! a cost carries the derived one, a header that carries none is under the
+//! derived one, and a child derives from its parent's cost, carried or filled
+//! — none for the genesis, whose sixteen fields have no place for one. What
+//! this crate builds carries its cost whenever it is not zero, so Go's import
+//! path, which reads an absent cost as zero (consensus.go:169-175), and cevm
+//! take it as well.
 //!
-//! Go keeps the cost beside the header as well — a map keyed by the header's
-//! hash (`customtypes/header_ext.go:22-48`), persisted under `bgc`
-//! (`customrawdb/database_ext.go`) — and two things follow that this crate
-//! does not reproduce. Its builder writes the cost only into that map
-//! (`FinalizeAndAssemble`, consensus.go:366-434), never into the 17- or
-//! 20-field header it seals; and its VM fills a header's absent cost from the
-//! parent before verifying (`ensureBlockGasCost`, plugin/evm/block.go:
-//! 288-319). So a Go-built block less than `TargetBlockRate` after its parent,
-//! owing a cost, passes Go's live VM and is refused by Go's own import path,
-//! by cevm and here. None of the 1,082,780 lux-mainnet blocks, nor any Zoo or
-//! Lux testnet block, is such a block: every one is at least two seconds after
-//! its parent. And a block whose cost Go never persisted — the genesis, a tip
-//! written by state sync (`syncervm_client.go:271`, `rawdb.WriteBlock`), a
-//! block from a luxd older than the `bgc` key — derives its child from nil,
-//! the minimum, after a restart, where a node that verified it derives
-//! [`cost`] from its value. The two differ only for a child less than
-//! `TargetBlockRate` after that parent; this crate is the second.
+//! The two Go paths part on one kind of block: one Go built less than
+//! `TargetBlockRate` after its parent, owing a cost it did not write. The live
+//! VM and this crate take it; the import path and cevm refuse it. None of the
+//! 1,082,780 lux-mainnet blocks, nor any Zoo or Lux testnet block, is such a
+//! block: every one is at least two seconds after its parent. And a block whose
+//! cost Go never persisted — the genesis, a tip written by state sync
+//! (`syncervm_client.go:271`, `rawdb.WriteBlock`), a block from a luxd older
+//! than the `bgc` key — derives its child from nil, the minimum, after a
+//! restart, where a node that verified it derives [`cost`] from its value. The
+//! two differ only for a child less than `TargetBlockRate` after that parent;
+//! this crate is the second.
 
 use alloy_consensus::{Header, ReceiptEnvelope, Transaction as _, TxEnvelope};
 use alloy_primitives::{Address, Bytes, U256};
@@ -308,7 +308,7 @@ pub fn base_fee(chain: &Chain, config: &Config, parent: &Header, time: u64) -> R
 ///
 /// `parent_cost` is `None` for the genesis, whose sixteen fields have no
 /// place for one, and that child's cost is the minimum; any other parent's is
-/// what its header carries, zero when it carries none. The parent's cost moves
+/// its own cost, carried or filled (see the module's note). The parent's cost moves
 /// by one step per second the child is faster or slower than the target rate,
 /// clamped to the schedule's bounds, with Go's saturation where a step
 /// overflows (`blockgascost.BlockGasCost`).

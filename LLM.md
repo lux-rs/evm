@@ -94,20 +94,28 @@ names a block the way the network names it.
   coinbase `0x0100…00` unless `allowFeeRecipients`; difficulty 1, nonce 0, mix
   0, empty uncle root; time ≥ parent and ≤ now + 10 s. `finish` holds the tips
   to the cost (`verifyBlockFee`) on BOTH the proposer's and verifier's path.
-  Held to Go three ways: Go's `InsertChain`, Go's live VM (the luxd EVM
-  plugin) and cevm all import a 430-block chain this crate built with equal
-  roots, and every block of the four Go corpora passes it.
+  Held to Go two ways: Go's `InsertChain` and Go's live VM (the luxd EVM
+  plugin) import a 430-block chain this crate built with equal roots — BLS
+  turned on mid-chain by an upgrade.json, and 0x0b–0x11 touched by BALANCE,
+  EXTCODESIZE and CALL before, at and after — and every block of the four Go
+  corpora passes it. cevm took the chain until it touched 0x0b–0x11, where it
+  charges gas Go does not.
 
-- **A block's cost lives in its header, or it is zero.** `consensus.go:169-175`
-  reads an absent cost as zero; Go's import path, cevm and this crate agree.
-  What this crate builds carries a non-zero cost ("19 lux"). Go's VM instead
-  pre-fills an absent cost from the parent (`ensureBlockGasCost`), and Go's
-  builder never writes one into the header — so a Go-built block under two
-  seconds after its parent that owes a cost passes Go's live VM and is refused
-  by Go's own import, cevm and here. No block of the corpora is one: all are
-  at least two seconds apart. Go also keeps the cost in a map by header hash,
-  persisted under `bgc`; a parent whose cost it never persisted (genesis,
-  state-synced tip, pre-`bgc` luxd) derives its child from nil after a restart.
+- **A block's cost is the live VM's: carried, or filled from the parent.**
+  Go's VM fills an absent cost from the parent before verifying
+  (`ensureBlockGasCost`, plugin/evm/block.go:288-319), and Go's builder never
+  writes one into the header; `block::rule` does the same — a carried cost
+  must be the derived one, an absent one is the derived one, and `Env::next`
+  takes the parent's cost (carried or filled; `None` for the genesis). What
+  this crate builds carries its cost whenever it is not zero ("19 lux", "23"),
+  so Go's import path, which reads an absent cost as zero
+  (`consensus.go:169-175`), and cevm accept it too. The Go paths part only on a
+  Go-built block under two seconds after its parent that owes a cost: the live
+  VM and this crate take it, the import path and cevm refuse it. No block of
+  the corpora is one: all are at least two seconds apart. Go also keeps the
+  cost in a map by header hash, persisted under `bgc`; a parent whose cost it
+  never persisted (genesis, state-synced tip, pre-`bgc` luxd) derives its child
+  from nil after a restart.
 
 - **PREVRANDAO is the header's difficulty.** Go's block context sets Random
   to `header.Difficulty` from Shanghai on (core/evm.go:82-89), so the opcode
@@ -124,7 +132,9 @@ names a block the way the network names it.
   and a zero parent beacon root — "20 eth", or "23" when it owes a cost; a
   Shanghai-only one is "17, withdrawals" in a block with its empty
   withdrawals. `begin` hands the parent beacon root to EIP-4788's contract
-  (a no-op where it has no code) and remembers the parent's hash. A block's
+  whenever an account is there (`ProcessBeaconBlockRoot`: a call to no account
+  returns early, and an existing EMPTY one is touched and deleted under
+  EIP-161, as Go deletes it) and remembers the parent's hash. A block's
   NUMBER reaches revm (it did not before: NUMBER answered 0 and BLOCKHASH
   nothing).
 
@@ -134,7 +144,30 @@ names a block the way the network names it.
   transition crosses one writes nonce 1 and code 0x01, at the genesis when not
   after it (before the allocation, which wins). Go then answers calls there;
   this crate answers the BLS12-381 `MODULES` and makes any other call — warp,
-  DEX settlement — an error that refuses the transaction.
+  DEX settlement — an error that refuses the transaction, on the builder's
+  path and the verifier's alike. A module answers only once `Env::active`
+  says its precompile is on (`Precompiles::serving`); before that 0x0b–0x11
+  are accounts like any other. `Env::refused` lists the active ones this
+  crate does not run, for a node to print at startup.
+
+- **The warm set is Go's: Ethereum's precompiles for the fork, nothing
+  else.** Go warms `vm.ActivePrecompiles(rules)` (core/state_transition.go:
+  524), which holds no Lux module, so BALANCE, EXTCODESIZE or CALL on
+  0x0b–0x11 costs the cold price the first time in a transaction, on or off.
+
+- **A Rust node must not join a Go validator set on a chain where an active
+  precompile is one it does not run** (warp, 0x…9999 DEX settlement, any
+  `upgrade.json` activation outside `MODULES`). Go executes a call there and
+  this crate refuses the transaction, so a Go-built block holding one is a
+  block the Rust node rejects: the two sides split. Hanzo restarts from its
+  genesis with Rust-only validators; porting those precompiles comes first
+  for any mixed set.
+
+- **Go refuses to start a fee split with nowhere for the kept half.**
+  `Genesis::verify` refuses `feeSplitTimestamp` without `allowFeeRecipients`
+  (`verifyFeeSplit`, params/extras/fee_split.go:38-58; the reward manager is
+  not run here). Lux mainnet's document as `mainnet()` holds it is such a
+  config: luxd v1.37.9 refuses it, and so does this crate.
 
 - **A warp predicate is refused, not verified.** Once `warpConfig` is on, a
   transaction whose access list names 0x0200…05 is a predicate Go prices and
