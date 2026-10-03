@@ -27,7 +27,8 @@
 //! plugin/evm/block.go:288-319). This crate is that VM: a header that carries
 //! a cost carries the derived one, a header that carries none is under the
 //! derived one, and a child derives from its parent's cost, carried or filled
-//! — none for the genesis, whose sixteen fields have no place for one. What
+//! — zero for the genesis, which Go sets beside its header (core/genesis.go:
+//! 509-514, and `ensureBlockGasCost` again, plugin/evm/block.go:299). What
 //! this crate builds carries its cost whenever it is not zero, so Go's import
 //! path, which reads an absent cost as zero (consensus.go:169-175), and cevm
 //! take it as well.
@@ -37,12 +38,12 @@
 //! VM and this crate take it; the import path and cevm refuse it. None of the
 //! 1,082,780 lux-mainnet blocks, nor any Zoo or Lux testnet block, is such a
 //! block: every one is at least two seconds after its parent. And a block whose
-//! cost Go never persisted — the genesis, a tip written by state sync
+//! cost Go never persisted — a tip written by state sync
 //! (`syncervm_client.go:271`, `rawdb.WriteBlock`), a block from a luxd older
 //! than the `bgc` key — derives its child from nil, the minimum, after a
 //! restart, where a node that verified it derives [`cost`] from its value. The
 //! two differ only for a child less than `TargetBlockRate` after that parent;
-//! this crate is the second.
+//! this crate is the second, and has no nil.
 
 use alloy_consensus::{Header, ReceiptEnvelope, Transaction as _, TxEnvelope};
 use alloy_primitives::{Address, Bytes, U256};
@@ -304,18 +305,14 @@ pub fn base_fee(chain: &Chain, config: &Config, parent: &Header, time: u64) -> R
 }
 
 /// The block gas cost of a block at `time` on top of a parent at
-/// `parent_time` whose own cost is `parent_cost`: `header.BlockGasCost`.
+/// `parent_time` whose own cost is `parent`: `header.BlockGasCost`.
 ///
-/// `parent_cost` is `None` for the genesis, whose sixteen fields have no
-/// place for one, and that child's cost is the minimum; any other parent's is
-/// its own cost, carried or filled (see the module's note). The parent's cost moves
-/// by one step per second the child is faster or slower than the target rate,
-/// clamped to the schedule's bounds, with Go's saturation where a step
-/// overflows (`blockgascost.BlockGasCost`).
-pub fn cost(config: &Config, parent_cost: Option<u64>, parent_time: u64, time: u64) -> u64 {
-    let Some(parent) = parent_cost else {
-        return config.min_block_gas_cost;
-    };
+/// `parent` is the parent's own cost, carried or filled — zero for the
+/// genesis (see the module's note). It moves by one step per second the child
+/// is faster or slower than the target rate, clamped to the schedule's
+/// bounds, with Go's saturation where a step overflows
+/// (`blockgascost.BlockGasCost`).
+pub fn cost(config: &Config, parent: u64, parent_time: u64, time: u64) -> u64 {
     let elapsed = time.saturating_sub(parent_time);
     let deviation = config.target_block_rate.abs_diff(elapsed);
     let change = config.block_gas_cost_step.saturating_mul(deviation);
@@ -413,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_block_carries_an_empty_window_and_the_minimum() {
+    fn the_first_block_carries_an_empty_window_and_steps_from_zero() {
         let chain = Chain::lux();
         let genesis = Header {
             base_fee_per_gas: Some(1),
@@ -422,9 +419,9 @@ mod tests {
         assert_eq!(window(&chain, &genesis, 99), Ok(Window::default()));
         assert_eq!(base_fee(&chain, &MAINNET, &genesis, 99), Ok(25_000_000_000));
         assert_eq!(
-            cost(&MAINNET, None, 0, 0),
-            0,
-            "a nil parent cost is the minimum"
+            cost(&MAINNET, 0, 0, 1),
+            200_000,
+            "one second after the genesis, whose cost is zero"
         );
     }
 
@@ -506,25 +503,21 @@ mod tests {
     #[test]
     fn the_block_gas_cost_steps_toward_the_target_rate() {
         let c = MAINNET;
-        assert_eq!(cost(&c, Some(0), 100, 100), 400_000, "two seconds fast");
-        assert_eq!(cost(&c, Some(0), 100, 101), 200_000, "one second fast");
+        assert_eq!(cost(&c, 0, 100, 100), 400_000, "two seconds fast");
+        assert_eq!(cost(&c, 0, 100, 101), 200_000, "one second fast");
         assert_eq!(
-            cost(&c, Some(300_000), 100, 102),
+            cost(&c, 300_000, 100, 102),
             300_000,
             "on the target, unchanged"
         );
+        assert_eq!(cost(&c, 300_000, 100, 104), 0, "slow, down to the floor");
         assert_eq!(
-            cost(&c, Some(300_000), 100, 104),
-            0,
-            "slow, down to the floor"
-        );
-        assert_eq!(
-            cost(&c, Some(900_000), 100, 100),
+            cost(&c, 900_000, 100, 100),
             1_000_000,
             "fast, up to the ceiling"
         );
         assert_eq!(
-            cost(&c, Some(0), 100, 99),
+            cost(&c, 0, 100, 99),
             400_000,
             "a time before the parent is no time"
         );
@@ -533,7 +526,7 @@ mod tests {
             ..c
         };
         assert_eq!(
-            cost(&steep, Some(1), 100, 100),
+            cost(&steep, 1, 100, 100),
             1_000_000,
             "an overflowing step saturates"
         );
