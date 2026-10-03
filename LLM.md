@@ -26,7 +26,10 @@ names a block the way the network names it.
 
 - **A root is a Merkle-Patricia trie, never a digest over a sorted list.** Two
   rules a naive store gets wrong and that both move the root: a zero slot is an
-  ABSENT slot, and an empty account (EIP-161) is an ABSENT account.
+  ABSENT slot, and an empty account (EIP-161) is an ABSENT account. Empty is
+  Go's `stateObject.empty` — nonce 0, balance 0, no code, storage NOT
+  considered — so an account touched while empty goes storage and all (a
+  genesis allocation of storage alone makes one).
 
 - **The world IS its tries, and they are persistent.** `state::World` keeps
   accounts in a `trie::Trie` keyed by `keccak(address)`, each account's
@@ -79,9 +82,10 @@ names a block the way the network names it.
 
 - **`Checks` is a value, not a flag.** Consensus asks "may this be in a block",
   where paying is the point; a simulation asks "what would this do", where the
-  caller is not paying. `Checks::Simulated` sets aside the three rules about
-  paying and NOTHING else, and is only reachable through `block::call`, which
-  takes the world by value so discarding the result is structural.
+  caller is not paying. `Checks::Simulated` sets aside the rules about paying
+  and the block's gas limit (a call runs in a gas pool of its own) and NOTHING
+  else, and is only reachable through `block::call`, which takes the world by
+  value so discarding the result is structural.
 
 - **A block's header is derived from its parent, never chosen.** `Env::next`
   is the one way to a child's environment and `block::rule` the one check of a
@@ -106,15 +110,16 @@ names a block the way the network names it.
   (`ensureBlockGasCost`, plugin/evm/block.go:288-319), and Go's builder never
   writes one into the header; `block::rule` does the same — a carried cost
   must be the derived one, an absent one is the derived one, and `Env::next`
-  takes the parent's cost (carried or filled; `None` for the genesis). What
-  this crate builds carries its cost whenever it is not zero ("19 lux", "23"),
-  so Go's import path, which reads an absent cost as zero
+  takes the parent's cost (carried or filled; zero for the genesis, as Go sets
+  it, core/genesis.go:509-514 — so a block one second after the genesis owes a
+  step). What this crate builds carries its cost whenever it is not zero
+  ("19 lux", "23"), so Go's import path, which reads an absent cost as zero
   (`consensus.go:169-175`), and cevm accept it too. The Go paths part only on a
   Go-built block under two seconds after its parent that owes a cost: the live
   VM and this crate take it, the import path and cevm refuse it. No block of
   the corpora is one: all are at least two seconds apart. Go also keeps the
   cost in a map by header hash, persisted under `bgc`; a parent whose cost it
-  never persisted (genesis, state-synced tip, pre-`bgc` luxd) derives its child
+  never persisted (state-synced tip, pre-`bgc` luxd) derives its child
   from nil after a restart.
 
 - **PREVRANDAO is the header's difficulty.** Go's block context sets Random
@@ -144,8 +149,9 @@ names a block the way the network names it.
   transition crosses one writes nonce 1 and code 0x01, at the genesis when not
   after it (before the allocation, which wins). Go then answers calls there;
   this crate answers the BLS12-381 `MODULES` and makes any other call — warp,
-  DEX settlement — an error that refuses the transaction, on the builder's
-  path and the verifier's alike. A module answers only once `Env::active`
+  DEX settlement — an error that refuses the transaction (`Invalid::Unrun`,
+  so a builder can tell work done for nothing), on the builder's path and the
+  verifier's alike. A module answers only once `Env::active`
   says its precompile is on (`Precompiles::serving`); before that 0x0b–0x11
   are accounts like any other. `Env::refused` lists the active ones this
   crate does not run, for a node to print at startup.

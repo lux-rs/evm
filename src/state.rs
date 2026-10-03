@@ -150,12 +150,12 @@ impl Account {
         }
     }
 
-    /// Whether this account is one the state trie does not carry: EIP-161's
-    /// nonce 0, balance 0, no code.
+    /// Whether this account is EIP-161's empty: nonce 0, balance 0, no code.
     ///
-    /// Storage is not part of the test, and cannot be: an account with storage
-    /// and no code is only reachable by having had code, which means it had a
-    /// nonce.
+    /// Storage is not part of the test, as it is not of Go's
+    /// (`stateObject.empty`, core/state/state_object.go:90): a touched account
+    /// that is empty is deleted storage and all (`Finalise(true)`). A genesis
+    /// allocation of storage alone makes one.
     pub fn is_empty(&self) -> bool {
         self.nonce == 0 && self.balance.is_zero() && self.code_hash == KECCAK_EMPTY
     }
@@ -319,8 +319,9 @@ impl World {
                 entry.storage.set(&slot, value.present_value);
             }
 
-            // EIP-161: an account touched into emptiness is deleted.
-            if entry.is_empty() && entry.storage.is_empty() {
+            // EIP-161: an account touched while empty is deleted, whatever
+            // storage it holds.
+            if entry.is_empty() {
                 self.accounts.remove(&at);
             } else {
                 self.accounts.insert(&at, entry);
