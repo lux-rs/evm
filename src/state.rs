@@ -24,24 +24,101 @@
 //!   no code. Touching one and leaving it behind forks the state root.
 //!
 //! Both are applied in [`World::commit`], which is the only way state changes.
+//!
+//! THE WORLD IS ITS TRIES. Accounts live in the state trie, keyed by
+//! `keccak(address)`, and each account's storage in its own trie, keyed by
+//! `keccak(slot)` — [`crate::trie`], whose nodes never change once made. A
+//! transaction's changes make new nodes along the changed paths and share the
+//! rest, so a copy of the world is a pointer, and its root costs the nodes made
+//! since the root before it. Nothing is cached beside the state: every hash is
+//! a node's own, of a node that cannot change, so there is no second place for
+//! the state to be and nothing to invalidate.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use revm::bytecode::Bytecode;
 use revm::primitives::{StorageKey, StorageValue, KECCAK_EMPTY};
 use revm::state::{AccountInfo, EvmState};
 use revm::{Database, DatabaseCommit};
 
 use crate::root;
+use crate::trie::{Trie, Value};
 
-/// One account as the world holds it.
+/// One account's storage: its trie, keyed by `keccak(slot)`.
 ///
-/// The same four fields the trie commits to, except that storage is kept whole
-/// rather than pre-hashed: the root is derived from it on demand, because a
-/// cached root is a second place for the state to be, and the two disagree the
-/// first time someone forgets to invalidate it.
+/// A zero slot is never held — writing zero removes the key — so what is here
+/// is exactly what the storage root commits to.
+#[derive(Clone, Default)]
+pub struct Storage(Trie<StorageValue>);
+
+impl Value for StorageValue {
+    fn rlp(&self) -> Vec<u8> {
+        alloy_rlp::encode(self)
+    }
+}
+
+fn slot(key: &StorageKey) -> B256 {
+    keccak256(key.to_be_bytes::<32>())
+}
+
+impl Storage {
+    /// The value at `key`; an unset slot is zero.
+    pub fn get(&self, key: &StorageKey) -> StorageValue {
+        self.0.get(&slot(key)).copied().unwrap_or_default()
+    }
+
+    /// Set a slot. Zero removes it.
+    pub fn set(&mut self, key: &StorageKey, value: StorageValue) {
+        if value.is_zero() {
+            self.0.remove(&slot(key));
+        } else {
+            self.0.insert(&slot(key), value);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The `storageRoot`.
+    pub fn root(&self) -> B256 {
+        self.0.root()
+    }
+}
+
+impl FromIterator<(StorageKey, StorageValue)> for Storage {
+    fn from_iter<I: IntoIterator<Item = (StorageKey, StorageValue)>>(slots: I) -> Self {
+        let mut s = Self::default();
+        for (k, v) in slots {
+            s.set(&k, v);
+        }
+        s
+    }
+}
+
+/// Two storages are equal when they commit to the same root.
+impl PartialEq for Storage {
+    fn eq(&self, other: &Self) -> bool {
+        self.root() == other.root()
+    }
+}
+
+impl Eq for Storage {}
+
+impl std::fmt::Debug for Storage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Storage({} slots, root {})", self.len(), self.root())
+    }
+}
+
+/// One account as the world holds it: the four fields the trie commits to,
+/// with storage kept as its own trie.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
     pub nonce: u64,
@@ -49,7 +126,7 @@ pub struct Account {
     /// `keccak(code)`, or [`KECCAK_EMPTY`] for an account with no code — never
     /// zero, which is a different account to every other implementation.
     pub code_hash: B256,
-    pub storage: BTreeMap<StorageKey, StorageValue>,
+    pub storage: Storage,
 }
 
 impl Default for Account {
@@ -58,7 +135,7 @@ impl Default for Account {
             nonce: 0,
             balance: U256::ZERO,
             code_hash: KECCAK_EMPTY,
-            storage: BTreeMap::new(),
+            storage: Storage::default(),
         }
     }
 }
@@ -85,24 +162,44 @@ impl Account {
 
     /// This account's `storageRoot`.
     pub fn storage_root(&self) -> B256 {
-        root::storage(self.storage.iter().map(|(k, v)| ((*k).into(), *v)))
+        self.storage.root()
+    }
+}
+
+impl Value for Account {
+    fn rlp(&self) -> Vec<u8> {
+        alloy_rlp::encode(root::account(
+            self.nonce,
+            self.balance,
+            self.storage_root(),
+            self.code_hash,
+        ))
     }
 }
 
 /// Every account on the chain, and the code they run.
 ///
-/// Ordered rather than hashed: two nodes that walk this map take the same walk,
-/// which is what makes a dump of it comparable between implementations. The
-/// trie sorts on its own, so ordering is not load-bearing for the root — it is
-/// load-bearing for being able to read one.
-#[derive(Clone, Debug, Default)]
+/// A copy is cheap and shares everything with the world it was copied from
+/// until one of them changes — which is what lets a block be executed on a
+/// copy of its parent's world, and the copy kept or dropped.
+#[derive(Clone, Default)]
 pub struct World {
-    accounts: BTreeMap<Address, Account>,
+    accounts: Trie<Account>,
     code: BTreeMap<B256, Bytecode>,
     /// The last 256 block hashes, for `BLOCKHASH`. Keyed by number, and the
     /// EVM asks for numbers that may not be here — an unknown number is zero,
     /// which is what the opcode is defined to return.
     hashes: BTreeMap<u64, B256>,
+}
+
+impl std::fmt::Debug for World {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "World({} accounts, root {})", self.len(), self.root())
+    }
+}
+
+fn key(who: &Address) -> B256 {
+    keccak256(who)
 }
 
 impl World {
@@ -114,7 +211,7 @@ impl World {
     pub fn allocated(alloc: impl IntoIterator<Item = (Address, U256)>) -> Self {
         let mut w = Self::new();
         for (who, balance) in alloc {
-            w.accounts.insert(who, Account::funded(balance));
+            w.accounts.insert(&key(&who), Account::funded(balance));
         }
         w
     }
@@ -128,27 +225,22 @@ impl World {
     }
 
     pub fn get(&self, who: &Address) -> Option<&Account> {
-        self.accounts.get(who)
-    }
-
-    pub fn accounts(&self) -> impl Iterator<Item = (&Address, &Account)> {
-        self.accounts.iter()
+        self.accounts.get(&key(who))
     }
 
     /// What an account holds. An account nobody has ever touched holds zero,
     /// which is the same answer as an account that spent everything.
     pub fn balance(&self, who: &Address) -> U256 {
-        self.accounts.get(who).map(|a| a.balance).unwrap_or_default()
+        self.get(who).map(|a| a.balance).unwrap_or_default()
     }
 
     pub fn nonce(&self, who: &Address) -> u64 {
-        self.accounts.get(who).map(|a| a.nonce).unwrap_or_default()
+        self.get(who).map(|a| a.nonce).unwrap_or_default()
     }
 
     /// The code at an address, empty if there is none.
     pub fn code(&self, who: &Address) -> Bytecode {
-        self.accounts
-            .get(who)
+        self.get(who)
             .and_then(|a| self.code.get(&a.code_hash))
             .cloned()
             .unwrap_or_default()
@@ -156,9 +248,8 @@ impl World {
 
     /// One storage slot. An unset slot is zero — it is not absent, it is zero.
     pub fn storage(&self, who: &Address, slot: StorageKey) -> StorageValue {
-        self.accounts
-            .get(who)
-            .and_then(|a| a.storage.get(&slot).copied())
+        self.get(who)
+            .map(|a| a.storage.get(&slot))
             .unwrap_or_default()
     }
 
@@ -171,7 +262,7 @@ impl World {
                 self.code.insert(code.hash_slow(), code);
             }
         }
-        self.accounts.insert(who, account);
+        self.accounts.insert(&key(&who), account);
     }
 
     /// Record a block hash for `BLOCKHASH`, keeping the last 256 — the window
@@ -184,15 +275,10 @@ impl World {
         }
     }
 
-    /// The `stateRoot`: a Merkle-Patricia trie over every account, each carrying
-    /// the root of its own storage trie.
+    /// The `stateRoot`: the state trie's root, each account carrying the root
+    /// of its own storage trie.
     pub fn root(&self) -> B256 {
-        root::state(self.accounts.iter().map(|(who, a)| {
-            (
-                *who,
-                root::account(a.nonce, a.balance, a.storage_root(), a.code_hash),
-            )
-        }))
+        self.accounts.root()
     }
 
     /// Apply what a transaction did.
@@ -206,8 +292,9 @@ impl World {
             if !account.is_touched() {
                 continue;
             }
+            let at = key(&who);
             if account.is_selfdestructed() {
-                self.accounts.remove(&who);
+                self.accounts.remove(&at);
                 continue;
             }
 
@@ -217,28 +304,26 @@ impl World {
                 }
             }
 
-            let entry = self.accounts.entry(who).or_default();
+            let mut entry = self.accounts.get(&at).cloned().unwrap_or_default();
             entry.nonce = account.info.nonce;
             entry.balance = account.info.balance;
             entry.code_hash = account.info.code_hash;
             // A created account is created empty. Anything at this address
             // before belonged to a contract that no longer exists.
             if account.is_created() {
-                entry.storage.clear();
+                entry.storage = Storage::default();
             }
             for (slot, value) in account.storage {
                 // A zero slot is an absent slot; keeping it would put a key in
                 // the trie that no other implementation has.
-                if value.present_value.is_zero() {
-                    entry.storage.remove(&slot);
-                } else {
-                    entry.storage.insert(slot, value.present_value);
-                }
+                entry.storage.set(&slot, value.present_value);
             }
 
             // EIP-161: an account touched into emptiness is deleted.
             if entry.is_empty() && entry.storage.is_empty() {
-                self.accounts.remove(&who);
+                self.accounts.remove(&at);
+            } else {
+                self.accounts.insert(&at, entry);
             }
         }
     }
@@ -257,7 +342,7 @@ impl Database for World {
     type Error = Infallible;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        Ok(self.accounts.get(&address).map(|a| AccountInfo {
+        Ok(self.get(&address).map(|a| AccountInfo {
             balance: a.balance,
             nonce: a.nonce,
             code_hash: a.code_hash,

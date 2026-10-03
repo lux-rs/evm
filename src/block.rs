@@ -64,14 +64,15 @@ pub struct Env {
     pub difficulty: U256,
     pub extra_data: Bytes,
     pub mix_hash: B256,
-    /// The seventeenth header field.
+    /// The block gas cost the header carries — none when it is zero, which is
+    /// how Go reads the ordinary 17-field shape (see [`crate::header`]).
     ///
     /// SUPPLIED, NOT DERIVED. Go computes it from the fee schedule —
     /// `minBlockGasCost`, `maxBlockGasCost`, `blockGasCostStep` and how long
     /// the parent took — and that schedule is not modelled here. Every network
     /// whose genesis this crate carries sets all three to zero, which makes the
     /// value zero for every block, and the mainnet header history agrees: block
-    /// 1 through 1,082,780 all carry zero. A network with a non-zero schedule
+    /// 1 through 1,082,780 all carry none. A network with a non-zero schedule
     /// needs the formula before this can be right for it.
     pub block_gas_cost: U256,
 }
@@ -280,8 +281,8 @@ pub fn call(mut world: World, env: &Env, tx: TxEnv) -> Result<ExecutionResult, I
 #[derive(Clone, Debug)]
 pub struct Built {
     /// The header in the shape the chain accepts: sixteen fields at genesis,
-    /// seventeen after. See [`crate::header`] for why that is not one layout
-    /// with an optional field.
+    /// seventeen after. See [`crate::header`] for why a shape is a layout and
+    /// not one list with optional fields.
     pub header: header::Lux,
     pub transactions: Vec<TxEnvelope>,
     pub receipts: Vec<ReceiptEnvelope>,
@@ -360,14 +361,13 @@ pub fn finish(
         mix_hash: env.mix_hash,
         nonce: B64::ZERO,
         base_fee_per_gas: Some(env.base_fee),
-        // No post-London tail: on this chain the seventeenth field is
-        // `blockGasCost`, and a header carrying both shapes is one no node has
-        // ever accepted.
+        // No post-London tail: a block here is "17" or "19 lux", and neither
+        // has a position for one.
         ..Default::default()
     };
     Built {
-        // Every block but the genesis carries the Lux field. The genesis is
-        // built by `genesis::Genesis`, never here.
+        // Every block but the genesis is in a Lux shape. The genesis is built
+        // by `genesis::Genesis`, never here.
         header: header::Lux::block(fields, env.block_gas_cost),
         transactions,
         receipts,
